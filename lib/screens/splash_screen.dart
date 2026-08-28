@@ -32,7 +32,6 @@ class _SplashScreenState extends State<SplashScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: Colors.white,
       body: Center(
         child: Padding(
           padding: const EdgeInsets.all(24.0),
@@ -65,10 +64,11 @@ class _SplashScreenState extends State<SplashScreen> {
               Row(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  Image.network(
-                    'https://upload.wikimedia.org/wikipedia/en/4/4f/NHPC_logo.png', // fixed URL
+                  Image.asset(
+                    'assets/images/splash_logo.png',
                     height: 50,
-                    errorBuilder: (_, __, ___) => const Text('NHPC', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 20)),
+                    errorBuilder: (_, __, ___) =>
+                        const Icon(Icons.pedal_bike, size: 50),
                   ),
                   const SizedBox(width: 12),
                   const Text(

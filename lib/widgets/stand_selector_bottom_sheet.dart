@@ -1,325 +1,130 @@
 import 'package:flutter/material.dart';
-import 'package:supabase_flutter/supabase_flutter.dart';
+
+import '../core/errors/app_exception.dart';
 import '../services/cycle_service.dart';
+import '../services/ride_operation_service.dart';
 
-class StandSelectorContent extends StatefulWidget {
-  final bool forReturn;
-  const StandSelectorContent({super.key, required this.forReturn});
+class StandSelection {
+  const StandSelection({required this.standId, this.cycleId});
 
-  @override
-  State<StandSelectorContent> createState() => _StandSelectorContentState();
+  final String standId;
+  final String? cycleId;
 }
 
-class _StandSelectorContentState extends State<StandSelectorContent> {
-  List<Map<String, dynamic>> _blocks = [];
-  List<Map<String, dynamic>> _stands = [];
-  List<Map<String, dynamic>> _cycles = [];
-  bool _isLoading = true;
-  String? _selectedBlockId;
-  String? _selectedStandId;
+Future<StandSelection?> showStandSelectorBottomSheet(BuildContext context, {required bool forReturn}) => showModalBottomSheet<StandSelection>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      builder: (_) => _StandSelector(forReturn: forReturn),
+    );
+
+class _StandSelector extends StatefulWidget {
+  const _StandSelector({required this.forReturn});
+  final bool forReturn;
+
+  @override
+  State<_StandSelector> createState() => _StandSelectorState();
+}
+
+class _StandSelectorState extends State<_StandSelector> {
+  final _service = CycleService();
+  final _operations = RideOperationService();
+  List<Map<String, dynamic>> _stands = const [];
+  bool _loading = true;
+  String? _error;
 
   @override
   void initState() {
     super.initState();
-    _loadData();
+    _load();
   }
 
-  Future<void> _loadData() async {
-    setState(() => _isLoading = true);
+  Future<void> _load() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
     try {
-      final blocksResponse = await Supabase.instance.client
-          .from('blocks')
-          .select('*')
-          .order('name');
-      _blocks = List<Map<String, dynamic>>.from(blocksResponse);
-
-      if (_blocks.isNotEmpty) {
-        _selectedBlockId = _blocks.first['id'];
-        await _loadStands();
-      }
-    } catch (e) {
-      print('Error loading data: $e');
-    }
-    setState(() => _isLoading = false);
-  }
-
-  Future<void> _loadStands() async {
-    if (_selectedBlockId == null) return;
-    try {
-      final query = Supabase.instance.client
-          .from('stands')
-          .select('*, cycles!stand_id(id, status, mac_address)')
-          .eq('block_id', _selectedBlockId!)
-          .order('name');
-
-      final response = await query;
-      _stands = List<Map<String, dynamic>>.from(response);
-
-      if (!widget.forReturn) {
-        _stands = _stands.where((stand) {
-          final cycles = stand['cycles'] as List?;
-          if (cycles == null) return false;
-          return cycles.any((c) => c['status'] == 'available');
-        }).toList();
-      }
-
-      setState(() {});
-    } catch (e) {
-      print('Error loading stands: $e');
+      // Keep every active stand visible. Start/return selection performs an
+      // exact-BSSID ESP inventory check when the user taps a stand, so an
+      // unverified stand can become available without being hidden upfront.
+      _stands = await _service.getStands();
+    } on AppException catch (error) {
+      _error = error.message;
+    } finally {
+      if (mounted) setState(() => _loading = false);
     }
   }
 
-  Future<void> _loadCyclesForStand(String standId) async {
-    setState(() => _isLoading = true);
+  Future<void> _choose(Map<String, dynamic> stand) async {
+    setState(() => _loading = true);
     try {
+      final inventory = await _operations.refreshStandInventory(stand['id'].toString());
       if (widget.forReturn) {
-        _cycles = [];
-      } else {
-        final response = await Supabase.instance.client
-            .from('cycles')
-            .select('id, mac_address, status')
-            .eq('stand_id', standId)
-            .eq('status', 'available');
-        _cycles = List<Map<String, dynamic>>.from(response);
+        if (inventory['present'] == true && (stand['capacity'] as num?)?.toInt() == 1) {
+          throw const AppException('This stand already has a cycle. Choose an empty stand for return.');
+        }
+        if (mounted) Navigator.pop(context, StandSelection(standId: stand['id'].toString()));
+        return;
       }
-      setState(() {});
-    } catch (e) {
-      print('Error loading cycles: $e');
+      final cycles = await _service.getAvailableCyclesAtStand(stand['id'].toString());
+      if (!mounted) return;
+      final cycle = await showModalBottomSheet<Map<String, dynamic>>(
+        context: context,
+        builder: (context) => ListView(
+          children: [
+            const ListTile(title: Text('Choose a cycle')),
+            ...cycles.map((item) => ListTile(
+                  leading: const Icon(Icons.pedal_bike),
+                  title: Text(item['cycle_number']?.toString() ?? item['id'].toString()),
+                  onTap: () => Navigator.pop(context, item),
+                )),
+          ],
+        ),
+      );
+      if (mounted && cycle != null) Navigator.pop(context, StandSelection(standId: stand['id'].toString(), cycleId: cycle['id'].toString()));
+    } on AppException catch (error) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(error.message)));
+    } finally {
+      if (mounted) setState(() => _loading = false);
     }
-    setState(() => _isLoading = false);
   }
 
   @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      height: MediaQuery.of(context).size.height * 0.8,
-      child: Column(
-        children: [
-          Text(
-            widget.forReturn ? 'Select Stand to Return' : 'Select Stand & Cycle',
-            style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+  Widget build(BuildContext context) => SizedBox(
+        height: MediaQuery.sizeOf(context).height * .72,
+        child: Column(children: [
+          Padding(
+            padding: const EdgeInsets.all(20),
+            child: Row(children: [
+              Expanded(child: Text(widget.forReturn ? 'Choose a return stand' : 'Choose a stand', style: Theme.of(context).textTheme.titleLarge)),
+              IconButton(onPressed: _loading ? null : _load, icon: const Icon(Icons.refresh)),
+            ]),
           ),
-          const SizedBox(height: 16),
-          if (_isLoading)
-            const Center(child: CircularProgressIndicator())
-          else if (_selectedStandId == null) ...[
-            // Block Selector
-            DropdownButtonFormField<String>(
-              value: _selectedBlockId,
-              decoration: const InputDecoration(
-                labelText: 'Select Block',
-                border: OutlineInputBorder(),
-              ),
-              items: _blocks.map((block) {
-                return DropdownMenuItem<String>(
-                  value: block['id'],
-                  child: Text(block['name'] ?? 'Unknown'),
-                );
-              }).toList(),
-              onChanged: (value) {
-                setState(() {
-                  _selectedBlockId = value;
-                  _selectedStandId = null;
-                });
-                if (value != null) {
-                  _loadStands();
-                }
-              },
-            ),
-            const SizedBox(height: 12),
-            Text(
-              widget.forReturn ? 'Choose a stand:' : 'Choose a stand:',
-              style: const TextStyle(fontSize: 16),
-            ),
-            const SizedBox(height: 12),
-            Expanded(
-              child: _stands.isEmpty
-                  ? Center(
-                child: Text(
-                  widget.forReturn
-                      ? 'No stands in this block.'
-                      : 'No available cycles in this block.',
-                ),
-              )
-                  : GridView.builder(
-                gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                  crossAxisCount: 2,
-                  crossAxisSpacing: 12,
-                  mainAxisSpacing: 12,
-                  childAspectRatio: 1.5,
-                ),
-                itemCount: _stands.length,
-                itemBuilder: (context, index) {
-                  final stand = _stands[index];
-                  final cycles = stand['cycles'] as List?;
-                  final hasCycle = cycles?.isNotEmpty ?? false;
-
-                  return Card(
-                    color: hasCycle ? Colors.green.shade50 : Colors.grey.shade100,
-                    child: InkWell(
-                      onTap: () {
-                        if (widget.forReturn) {
-                          Navigator.pop(context, {
-                            'cycleId': null,
-                            'standId': stand['id'],
-                          });
-                        } else {
-                          if (hasCycle) {
-                            setState(() {
-                              _selectedStandId = stand['id'];
-                            });
-                            _loadCyclesForStand(stand['id']);
-                          } else {
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              const SnackBar(
-                                content: Text('No available cycles at this stand.'),
-                                backgroundColor: Colors.orange,
-                              ),
-                            );
-                          }
-                        }
-                      },
-                      borderRadius: BorderRadius.circular(12),
-                      child: Center(
-                        child: Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            Icon(
-                              hasCycle ? Icons.storefront : Icons.storefront,
-                              size: 40,
-                              color: hasCycle ? Colors.green : Colors.grey,
-                            ),
-                            const SizedBox(height: 8),
-                            Text(
-                              stand['name'] ?? 'Unknown',
-                              style: const TextStyle(fontWeight: FontWeight.w500),
-                            ),
-                            Text(
-                              hasCycle ? 'Has cycle' : 'Empty',
-                              style: TextStyle(
-                                fontSize: 12,
-                                color: hasCycle ? Colors.green : Colors.grey,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                  );
-                },
-              ),
-            ),
-          ] else ...[
-            // Show cycles
-            Row(
-              children: [
-                IconButton(
-                  icon: const Icon(Icons.arrow_back),
-                  onPressed: () {
-                    setState(() {
-                      _selectedStandId = null;
-                      _cycles = [];
-                    });
-                  },
-                ),
-                const Text(
-                  'Select a cycle:',
-                  style: TextStyle(fontSize: 16),
-                ),
-                const Spacer(),
-                Text(
-                  '${_cycles.length} available',
-                  style: TextStyle(color: Colors.grey[600]),
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            Expanded(
-              child: _cycles.isEmpty
-                  ? const Center(child: Text('No available cycles at this stand.'))
-                  : GridView.builder(
-                gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                  crossAxisCount: 2,
-                  crossAxisSpacing: 12,
-                  mainAxisSpacing: 12,
-                ),
-                itemCount: _cycles.length,
-                itemBuilder: (context, index) {
-                  final cycle = _cycles[index];
-                  return Card(
-                    elevation: 2,
-                    child: InkWell(
-                      onTap: () {
-                        Navigator.pop(context, {
-                          'cycleId': cycle['id'],
-                          'standId': _selectedStandId,
-                        });
-                      },
-                      borderRadius: BorderRadius.circular(12),
-                      child: Center(
-                        child: Padding(
-                          padding: const EdgeInsets.all(8.0),
-                          child: Column(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              const Icon(Icons.directions_bike, size: 40, color: Colors.green),
-                              const SizedBox(height: 8),
-                              Text(
-                                cycle['id'] ?? 'Unknown',
-                                style: const TextStyle(fontWeight: FontWeight.w500),
-                                textAlign: TextAlign.center,
-                              ),
-                              if (cycle['mac_address'] != null)
-                                Text(
-                                  cycle['mac_address'],
-                                  style: const TextStyle(
-                                    fontSize: 10,
-                                    color: Colors.grey,
-                                  ),
-                                ),
-                            ],
+          Expanded(
+            child: _loading
+                ? const Center(child: CircularProgressIndicator())
+                : _error != null
+                    ? Center(child: Padding(padding: const EdgeInsets.all(24), child: Text(_error!, textAlign: TextAlign.center)))
+                    : _stands.isEmpty
+                        ? Center(child: Text(widget.forReturn ? 'No return stands are currently available.' : 'No cycles are available.'))
+                        : ListView.separated(
+                            itemCount: _stands.length,
+                            separatorBuilder: (_, _) => const Divider(height: 1),
+                            itemBuilder: (_, index) {
+                              final stand = _stands[index];
+                              final cycles = stand['cycles'] as List? ?? const [];
+                              final available = cycles.where((cycle) => cycle is Map && cycle['status'] == 'available' && cycle['physical_state'] == 'present').length;
+                              return ListTile(
+                                leading: Icon(widget.forReturn ? Icons.lock_outline : Icons.pedal_bike),
+                                title: Text(stand['name']?.toString() ?? 'Unnamed stand'),
+                              subtitle: Text('${stand['location'] ?? 'Campus'} · $available available · ${cycles.length}/${stand['capacity'] ?? '—'} slots'),
+                                trailing: const Icon(Icons.chevron_right),
+                                onTap: () => _choose(stand),
+                              );
+                            },
                           ),
-                        ),
-                      ),
-                    ),
-                  );
-                },
-              ),
-            ),
-          ],
-        ],
-      ),
-    );
-  }
-}
-
-// ============================================================
-// SHOW STAND SELECTOR BOTTOM SHEET
-// ============================================================
-
-Future<Map<String, String>?> showStandSelectorBottomSheet(
-    BuildContext context, {
-      required bool forReturn,
-    }) async {
-  final result = await showModalBottomSheet<Map<String, dynamic>>(
-    context: context,
-    isScrollControlled: true,
-    shape: const RoundedRectangleBorder(
-      borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-    ),
-    builder: (context) => StandSelectorContent(forReturn: forReturn),
-  );
-
-  if (result != null) {
-    final map = <String, String>{};
-    if (result['cycleId'] != null) {
-      map['cycleId'] = result['cycleId'] as String;
-    }
-    if (result['standId'] != null) {
-      map['standId'] = result['standId'] as String;
-    }
-    return map;
-  }
-  return null;
+          ),
+        ]),
+      );
 }

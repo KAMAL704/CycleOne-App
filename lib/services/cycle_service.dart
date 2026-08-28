@@ -1,549 +1,200 @@
 import 'package:supabase_flutter/supabase_flutter.dart';
-import 'esp_lock_service.dart';
 
+import '../core/errors/app_exception.dart';
+import '../core/logging/app_logger.dart';
+
+/// The only client-side access point for cycle, stand and ride data.
+/// Writes that change a ride or a cycle use SECURITY DEFINER RPCs; a client
+/// never updates a ride or a cycle row directly.
 class CycleService {
-  static final SupabaseClient _supabase = Supabase.instance.client;
+  CycleService({SupabaseClient? client}) : _client = client ?? Supabase.instance.client;
 
-  // ============================================================
-  // GET CYCLES FOR STAND
-  // ============================================================
+  final SupabaseClient _client;
 
-  static Future<List<Map<String, dynamic>>> getCyclesForStand(String standId) async {
+  Future<Map<String, dynamic>> getCycle(String cycleId) async {
     try {
-      final response = await _supabase
-          .from('cycles')
-          .select('*')
-          .eq('stand_id', standId)
-          .eq('status', 'available');
-      return List<Map<String, dynamic>>.from(response);
-    } catch (e) {
-      print('[CycleService] Error fetching cycles for stand: $e');
-      return [];
+      final row = await _client.from('cycles').select('*').eq('id', cycleId).maybeSingle();
+      if (row == null) throw const AppException('This cycle is not registered.');
+      final cycle = Map<String, dynamic>.from(row);
+      final standId = cycle['stand_id']?.toString();
+      if (standId != null && standId.isNotEmpty) {
+        cycle['stands'] = await _client.from('stands').select('*').eq('id', standId).maybeSingle();
+      }
+      return cycle;
+    } on AppException {
+      rethrow;
+    } catch (error, stackTrace) {
+      AppLogger.error('SUPABASE', error, stackTrace);
+      throw _databaseError(error, 'We could not verify that cycle.');
     }
   }
 
-  // ============================================================
-  // GET STANDS WITH AVAILABLE CYCLES
-  // ============================================================
-
-  static Future<List<Map<String, dynamic>>> getStandsWithAvailableCycles() async {
+  Future<Map<String, dynamic>> getStand(String standId) async {
     try {
-      final response = await _supabase
-          .from('stands')
-          .select('*, blocks(name), cycles!stand_id(id, status, mac_address)')
-          .order('name');
+      final row = await _client.from('stands').select('*').eq('id', standId).maybeSingle();
+      if (row == null) throw const AppException('This stand is not registered.');
+      return Map<String, dynamic>.from(row);
+    } on AppException {
+      rethrow;
+    } catch (error, stackTrace) {
+      AppLogger.error('SUPABASE', error, stackTrace);
+      throw _databaseError(error, 'We could not verify that stand.');
+    }
+  }
 
-      final standsWithCycles = response.where((stand) {
-        final cycles = stand['cycles'] as List?;
-        if (cycles == null) return false;
-        return cycles.any((c) => c['status'] == 'available');
+  Future<List<Map<String, dynamic>>> getStands({bool onlyWithAvailableCycles = false}) async {
+    try {
+      final rows = await _client.from('stands').select('id, name, location, latitude, longitude, capacity, status, cycles(id, cycle_number, status, physical_state)').eq('status', 'active').order('name');
+      final stands = List<Map<String, dynamic>>.from(rows);
+      if (!onlyWithAvailableCycles) return stands;
+      return stands.where((stand) {
+        final cycles = stand['cycles'] as List? ?? const [];
+        return cycles.any((cycle) => cycle is Map && cycle['status'] == 'available' && cycle['physical_state'] == 'present');
       }).toList();
-
-      return List<Map<String, dynamic>>.from(standsWithCycles);
-    } catch (e) {
-      print('[CycleService] Error fetching stands with cycles: $e');
-      return [];
+    } catch (error, stackTrace) {
+      AppLogger.error('SUPABASE', error, stackTrace);
+      throw _databaseError(error, 'We could not load the stands.');
     }
   }
 
-  // ============================================================
-  // GET ALL STANDS
-  // ============================================================
-
-  static Future<List<Map<String, dynamic>>> getAllStands() async {
+  Future<List<Map<String, dynamic>>> getAvailableCyclesAtStand(String standId) async {
     try {
-      final response = await _supabase
-          .from('stands')
-          .select('*, blocks(name), cycles!stand_id(id, status, mac_address)')
-          .order('name');
-      return List<Map<String, dynamic>>.from(response);
-    } catch (e) {
-      print('[CycleService] Error fetching all stands: $e');
-      return [];
+      final rows = await _client.from('cycles').select('id, cycle_number, qr_code, status, stand_id, physical_state, last_verified_at').eq('stand_id', standId).eq('status', 'available').eq('physical_state', 'present').order('cycle_number');
+      return List<Map<String, dynamic>>.from(rows);
+    } catch (error, stackTrace) {
+      AppLogger.error('SUPABASE', error, stackTrace);
+      throw _databaseError(error, 'We could not load cycles for this stand.');
     }
   }
 
-  // ============================================================
-  // CHECK CYCLE IN STAND
-  // ============================================================
-
-  static Future<bool> checkCycleInStand(String standId, String cycleId) async {
+  Future<Map<String, dynamic>> syncCyclePresence({required String standId, required String espMac, required bool present}) async {
     try {
-      print('[CycleService] 🔍 Checking cycle in stand');
-      print('[CycleService] 📍 Stand: $standId');
-      print('[CycleService] 🚲 Cycle: $cycleId');
-
-      if (standId.isEmpty || cycleId.isEmpty) {
-        print('[CycleService] ❌ Empty stand or cycle ID');
-        return false;
-      }
-
-      final cycleData = await _supabase
-          .from('cycles')
-          .select('id, status, stand_id, mac_address')
-          .eq('id', cycleId)
-          .maybeSingle();
-
-      if (cycleData == null) {
-        print('[CycleService] ❌ Cycle not found in database');
-        return false;
-      }
-
-      print('[CycleService] 📊 Cycle data: $cycleData');
-
-      if (cycleData['stand_id'] != standId) {
-        print('[CycleService] ❌ Cycle is not in this stand');
-        print('[CycleService] 📍 Expected stand: $standId');
-        print('[CycleService] 📍 Actual stand: ${cycleData['stand_id']}');
-        return false;
-      }
-
-      if (cycleData['status'] != 'available') {
-        print('[CycleService] ❌ Cycle is not available');
-        print('[CycleService] 📊 Status: ${cycleData['status']}');
-        return false;
-      }
-
-      print('[CycleService] ✅ Cycle is in stand and available');
-      return true;
-    } catch (e) {
-      print('[CycleService] ❌ Error checking cycle: $e');
-      return false;
-    }
-  }
-
-  // ============================================================
-  // GET CYCLE BY MAC (Multiple format support)
-  // ============================================================
-
-  static Future<Map<String, dynamic>?> getCycleByMac(String mac) async {
-    try {
-      print('[CycleService] 🔍 Looking for cycle with MAC: "$mac"');
-
-      if (mac.isEmpty) {
-        print('[CycleService] ❌ Empty MAC provided');
-        return null;
-      }
-
-      // Clean the MAC - remove all separators
-      final cleanMac = mac
-          .replaceAll(':', '')
-          .replaceAll('-', '')
-          .replaceAll(' ', '')
-          .replaceAll('.', '')
-          .toUpperCase();
-
-      print('[CycleService] 📡 Clean MAC: $cleanMac');
-
-      // Try multiple formats
-      final formats = [
-        cleanMac,
-        _addColons(cleanMac),
-        _addDashes(cleanMac),
-        _addDots(cleanMac),
-      ];
-
-      final uniqueFormats = formats.toSet().toList();
-
-      for (final format in uniqueFormats) {
-        print('[CycleService] 🔍 Trying format: "$format"');
-
-        final response = await _supabase
-            .from('cycles')
-            .select('*, stands!inner(id, name)')
-            .eq('mac_address', format)
-            .maybeSingle();
-
-        if (response != null) {
-          print('[CycleService] ✅ Found cycle with MAC: $format');
-          print('[CycleService] 🚲 Cycle ID: ${response['id']}');
-          return response;
-        }
-      }
-
-      // Try partial match
-      print('[CycleService] 🔍 Trying partial match...');
-      final partialResponse = await _supabase
-          .from('cycles')
-          .select('*, stands!inner(id, name)')
-          .ilike('mac_address', '%$cleanMac%')
-          .maybeSingle();
-
-      if (partialResponse != null) {
-        print('[CycleService] ✅ Found cycle with partial MAC match');
-        print('[CycleService] 🚲 Cycle ID: ${partialResponse['id']}');
-        return partialResponse;
-      }
-
-      print('[CycleService] ❌ No cycle found with MAC: $mac');
-      return null;
-    } catch (e) {
-      print('[CycleService] ❌ Error getting cycle by MAC: $e');
-      return null;
-    }
-  }
-
-  // ============================================================
-  // HELPER: Add colons to MAC
-  // ============================================================
-
-  static String _addColons(String mac) {
-    if (mac.length != 12) return mac;
-    return '${mac.substring(0,2)}:${mac.substring(2,4)}:${mac.substring(4,6)}:${mac.substring(6,8)}:${mac.substring(8,10)}:${mac.substring(10,12)}';
-  }
-
-  // ============================================================
-  // HELPER: Add dashes to MAC
-  // ============================================================
-
-  static String _addDashes(String mac) {
-    if (mac.length != 12) return mac;
-    return '${mac.substring(0,2)}-${mac.substring(2,4)}-${mac.substring(4,6)}-${mac.substring(6,8)}-${mac.substring(8,10)}-${mac.substring(10,12)}';
-  }
-
-  // ============================================================
-  // HELPER: Add dots to MAC
-  // ============================================================
-
-  static String _addDots(String mac) {
-    if (mac.length != 12) return mac;
-    return '${mac.substring(0,2)}.${mac.substring(2,4)}.${mac.substring(4,6)}.${mac.substring(6,8)}.${mac.substring(8,10)}.${mac.substring(10,12)}';
-  }
-
-  // ============================================================
-  // GET STAND BY ID
-  // ============================================================
-
-  static Future<Map<String, dynamic>?> getStandById(String standId) async {
-    try {
-      final response = await _supabase
-          .from('stands')
-          .select('*, blocks(name)')
-          .eq('id', standId)
-          .maybeSingle();
-      return response;
-    } catch (e) {
-      print('[CycleService] ❌ Error getting stand: $e');
-      return null;
-    }
-  }
-
-  // ============================================================
-  // START RIDE FROM STAND
-  // ============================================================
-
-  static Future<Map<String, dynamic>?> startRideFromStand(
-      String standId,
-      String cycleId,
-      ) async {
-    try {
-      print('[CycleService] =================================');
-      print('[CycleService] 🚲 Starting ride from stand');
-      print('[CycleService] 📍 Stand: $standId');
-      print('[CycleService] 🚲 Cycle: $cycleId');
-      print('[CycleService] =================================');
-
-      final userId = _supabase.auth.currentUser?.id;
-      final userEmail = _supabase.auth.currentUser?.email;
-
-      if (userId == null || userEmail == null) {
-        print('[CycleService] ❌ User not authenticated');
-        return null;
-      }
-
-      final cycle = await _supabase
-          .from('cycles')
-          .select('status, stand_id, mac_address')
-          .eq('id', cycleId)
-          .maybeSingle();
-
-      if (cycle == null) {
-        print('[CycleService] ❌ Cycle not found: $cycleId');
-        return null;
-      }
-
-      if (cycle['status'] != 'available') {
-        print('[CycleService] ❌ Cycle not available: ${cycle['status']}');
-        return null;
-      }
-
-      if (cycle['stand_id'] != standId) {
-        print('[CycleService] ❌ Cycle not in this stand');
-        return null;
-      }
-
-      final String mac = cycle['mac_address'] ?? '';
-
-      if (mac.isEmpty) {
-        print('[CycleService] ❌ No MAC address for cycle');
-        return null;
-      }
-
-      print('[CycleService] 📡 MAC: $mac');
-
-      final activeRide = await _supabase
-          .from('rides')
-          .select('id')
-          .eq('user_id', userId)
-          .eq('status', 'active')
-          .maybeSingle();
-
-      if (activeRide != null) {
-        print('[CycleService] ❌ User already has active ride');
-        return null;
-      }
-
-      print('[CycleService] 🔓 Unlocking ESP...');
-      final unlockSuccess = await ESPLockService.unlockNative(mac);
-
-      if (!unlockSuccess) {
-        print('[CycleService] ❌ ESP unlock failed');
-        return null;
-      }
-
-      print('[CycleService] ✅ ESP unlocked');
-
-      final rideResponse = await _supabase.from('rides').insert({
-        'user_id': userId,
-        'cycle_id': cycleId,
-        'start_stand_id': standId,
-        'start_time': DateTime.now().toIso8601String(),
-        'status': 'active',
-      }).select();
-
-      print('[CycleService] ✅ Ride created: ${rideResponse.first['id']}');
-
-      await _supabase.from('cycles').update({
-        'status': 'in_use',
-        'current_user_id': userId,
-      }).eq('id', cycleId);
-
-      print('[CycleService] ✅ Cycle updated: $cycleId -> in_use');
-
-      await _supabase.from('stand_activities').insert({
-        'stand_id': standId,
-        'cycle_id': cycleId,
-        'user_id': userId,
-        'action': 'unlock',
-        'user_email': userEmail,
-        'timestamp': DateTime.now().toIso8601String(),
+      final response = await _client.rpc('sync_cycle_presence', params: {
+        'p_stand_id': standId,
+        'p_esp_mac': espMac,
+        'p_present': present,
       });
-
-      print('[CycleService] ✅ Activity recorded: unlock at $standId');
-      print('[CycleService] =================================');
-
-      return rideResponse.first;
-    } catch (e) {
-      print('[CycleService] ❌ Error starting ride: $e');
-      return null;
+      if (response is! Map) throw const AppException('The server returned an invalid inventory response.');
+      return Map<String, dynamic>.from(response);
+    } catch (error, stackTrace) {
+      AppLogger.error('INVENTORY', error, stackTrace);
+      throw _databaseError(error, 'The stand inventory could not be verified.');
     }
   }
 
-  // ============================================================
-  // END RIDE AT STAND
-  // ============================================================
-
-  static Future<bool> endRideAtStand(
-      String rideId,
-      String cycleId,
-      String returnStandId,
-      ) async {
+  Future<Map<String, dynamic>?> getActiveRide() async {
+    final userId = _client.auth.currentUser?.id;
+    if (userId == null) return null;
     try {
-      print('[CycleService] =================================');
-      print('[CycleService] 📍 Ending ride at stand');
-      print('[CycleService] 🚲 Ride ID: $rideId');
-      print('[CycleService] 🚲 Cycle ID: $cycleId');
-      print('[CycleService] 📍 Return Stand: $returnStandId');
-      print('[CycleService] =================================');
+      final row = await _client.from('rides').select('*').eq('user_id', userId).eq('status', 'active').maybeSingle();
+      return row == null ? null : _attachRideRelations(Map<String, dynamic>.from(row));
+    } catch (error, stackTrace) {
+      AppLogger.error('SUPABASE', error, stackTrace);
+      throw _databaseError(error, 'We could not check your active ride.');
+    }
+  }
 
-      final userId = _supabase.auth.currentUser?.id;
-      final userEmail = _supabase.auth.currentUser?.email;
-
-      if (userId == null || userEmail == null) {
-        print('[CycleService] ❌ User not authenticated');
-        return false;
-      }
-
-      final cycle = await _supabase
-          .from('cycles')
-          .select('mac_address')
-          .eq('id', cycleId)
-          .maybeSingle();
-
-      if (cycle == null) {
-        print('[CycleService] ❌ Cycle not found');
-        return false;
-      }
-
-      final String mac = cycle['mac_address'] ?? '';
-
-      if (mac.isEmpty) {
-        print('[CycleService] ❌ No MAC address for cycle');
-        return false;
-      }
-
-      print('[CycleService] 📡 MAC: $mac');
-
-      final ride = await _supabase
+  Future<List<Map<String, dynamic>>> getRideHistory() async {
+    final userId = _client.auth.currentUser?.id;
+    if (userId == null) return const [];
+    try {
+      final rows = await _client
           .from('rides')
           .select('*')
-          .eq('id', rideId)
           .eq('user_id', userId)
-          .maybeSingle();
+          .order('started_at', ascending: false)
+          .limit(100);
+      final rides = List<Map<String, dynamic>>.from(rows).map((row) => Map<String, dynamic>.from(row)).toList();
+      if (rides.isEmpty) return rides;
 
-      if (ride == null) {
-        print('[CycleService] ❌ Ride not found: $rideId');
-        return false;
+      final cycleIds = rides.map((ride) => ride['cycle_id']?.toString()).whereType<String>().where((id) => id.isNotEmpty).toSet().toList();
+      final standIds = rides
+          .expand((ride) => [ride['start_stand_id']?.toString(), ride['end_stand_id']?.toString()])
+          .whereType<String>()
+          .where((id) => id.isNotEmpty)
+          .toSet()
+          .toList();
+      final cycleRows = cycleIds.isEmpty
+          ? const <Map<String, dynamic>>[]
+          : List<Map<String, dynamic>>.from(await _client.from('cycles').select('id, cycle_number, stand_id').inFilter('id', cycleIds));
+      final standRows = standIds.isEmpty
+          ? const <Map<String, dynamic>>[]
+          : List<Map<String, dynamic>>.from(await _client.from('stands').select('id, name, location').inFilter('id', standIds));
+      final cycles = {for (final cycle in cycleRows) cycle['id'].toString(): cycle};
+      final stands = {for (final stand in standRows) stand['id'].toString(): stand};
+      for (final ride in rides) {
+        ride['cycles'] = cycles[ride['cycle_id']?.toString()];
+        ride['start_stand'] = stands[ride['start_stand_id']?.toString()];
+        ride['end_stand'] = stands[ride['end_stand_id']?.toString()];
       }
+      return rides;
+    } catch (error, stackTrace) {
+      AppLogger.error('SUPABASE', error, stackTrace);
+      throw _databaseError(error, 'We could not load your ride history.');
+    }
+  }
 
-      if (ride['status'] == 'completed') {
-        print('[CycleService] ⚠️ Ride already completed');
-        return true;
-      }
+  /// PostgREST relationship names can differ after a legacy-schema cutover.
+  /// Fetching these three records explicitly keeps ride history working even
+  /// while the API schema cache is rebuilding or constraint names differ.
+  Future<Map<String, dynamic>> _attachRideRelations(Map<String, dynamic> ride) async {
+    final cycleId = ride['cycle_id']?.toString();
+    final standIds = [ride['start_stand_id']?.toString(), ride['end_stand_id']?.toString()]
+        .whereType<String>()
+        .where((id) => id.isNotEmpty)
+        .toSet()
+        .toList();
+    if (cycleId != null && cycleId.isNotEmpty) {
+      ride['cycles'] = await _client.from('cycles').select('id, cycle_number, stand_id').eq('id', cycleId).maybeSingle();
+    }
+    if (standIds.isNotEmpty) {
+      final rows = List<Map<String, dynamic>>.from(await _client.from('stands').select('id, name, location').inFilter('id', standIds));
+      final stands = {for (final stand in rows) stand['id'].toString(): stand};
+      ride['start_stand'] = stands[ride['start_stand_id']?.toString()];
+      ride['end_stand'] = stands[ride['end_stand_id']?.toString()];
+    }
+    return ride;
+  }
 
-      print('[CycleService] 🔒 Locking ESP...');
-      final lockSuccess = await ESPLockService.lockNative(mac);
+  /// Called only after the physical lock reported and verified an unlock.
+  Future<Map<String, dynamic>> startRide({required String cycleId, required String standId, required String espMac}) async {
+    try {
+      final response = await _client.rpc('start_cycle_ride', params: {'p_cycle_id': cycleId, 'p_start_stand_id': standId, 'p_esp_mac': espMac});
+      if (response is! Map) throw const AppException('The server returned an invalid start-ride response.');
+      return Map<String, dynamic>.from(response);
+    } catch (error, stackTrace) {
+      AppLogger.error('RIDE', error, stackTrace);
+      throw _databaseError(error, 'The lock opened, but the ride could not be recorded.');
+    }
+  }
 
-      if (!lockSuccess) {
-        print('[CycleService] ❌ ESP lock failed');
-        return false;
-      }
-
-      print('[CycleService] ✅ ESP locked');
-
-      final startTime = DateTime.parse(ride['start_time']);
-      final endTime = DateTime.now();
-      final duration = endTime.difference(startTime).inSeconds;
-
-      await _supabase.from('rides').update({
-        'end_time': endTime.toIso8601String(),
-        'duration': duration,
-        'return_stand_id': returnStandId,
-        'status': 'completed',
-      }).eq('id', rideId);
-
-      print('[CycleService] ✅ Ride completed: $rideId');
-
-      await _supabase.from('cycles').update({
-        'status': 'available',
-        'current_user_id': null,
-        'stand_id': returnStandId,
-      }).eq('id', cycleId);
-
-      print('[CycleService] ✅ Cycle moved to: $returnStandId');
-
-      await _supabase.from('stand_activities').insert({
-        'stand_id': returnStandId,
-        'cycle_id': cycleId,
-        'user_id': userId,
-        'action': 'lock',
-        'user_email': userEmail,
-        'timestamp': DateTime.now().toIso8601String(),
+  /// Called only after the physical lock reported and verified a lock.
+  Future<void> endRide({required String rideId, required String cycleId, required String destinationStandId, required String espMac}) async {
+    try {
+      final response = await _client.rpc('end_cycle_ride', params: {
+        'p_ride_id': rideId,
+        'p_cycle_id': cycleId,
+        'p_end_stand_id': destinationStandId,
+        'p_esp_mac': espMac,
       });
-
-      print('[CycleService] ✅ Activity recorded: lock at $returnStandId');
-      print('[CycleService] =================================');
-
-      return true;
-    } catch (e) {
-      print('[CycleService] ❌ Error ending ride: $e');
-      return false;
+      if (response != true) throw const AppException('The server did not complete the return.');
+    } catch (error, stackTrace) {
+      AppLogger.error('RIDE', error, stackTrace);
+      throw _databaseError(error, 'The lock closed, but the return could not be recorded.');
     }
   }
 
-  // ============================================================
-  // GET ACTIVE RIDE
-  // ============================================================
-
-  static Future<Map<String, dynamic>?> getActiveRide() async {
-    try {
-      final userId = _supabase.auth.currentUser?.id;
-      if (userId == null) return null;
-
-      final response = await _supabase
-          .from('rides')
-          .select('*, cycles!cycle_id(*), start_stand:start_stand_id(name), return_stand:return_stand_id(name)')
-          .eq('user_id', userId)
-          .eq('status', 'active')
-          .maybeSingle();
-
-      return response;
-    } catch (e) {
-      print('[CycleService] Error getting active ride: $e');
-      return null;
+  AppException _databaseError(Object error, String fallback) {
+    if (error is AppException) return error;
+    if (error is PostgrestException) {
+      final message = error.message.toLowerCase();
+      if (message.contains('already has an active ride')) return const AppException('You already have an active ride.');
+      if (message.contains('no longer available') || message.contains('cycle is not available')) return const AppException('That cycle is no longer available.');
+      if (message.contains('destination stand is full')) return const AppException('That stand is full. Choose another powered stand.');
+      if (message.contains('destination stand is unavailable')) return const AppException('That stand is not accepting returns right now.');
+      if (message.contains('active ride could not be verified')) return const AppException('Your active ride could not be verified. Refresh and try again.');
+      return AppException(error.message.isEmpty ? fallback : error.message, code: error.code);
     }
-  }
-
-  // ============================================================
-  // GET RIDE HISTORY
-  // ============================================================
-
-  static Future<List<Map<String, dynamic>>> getRideHistory() async {
-    try {
-      final userId = _supabase.auth.currentUser?.id;
-      if (userId == null) return [];
-
-      final response = await _supabase
-          .from('rides')
-          .select('*, cycles!cycle_id(*), start_stand:start_stand_id(name), return_stand:return_stand_id(name)')
-          .eq('user_id', userId)
-          .order('start_time', ascending: false)
-          .limit(50);
-
-      return List<Map<String, dynamic>>.from(response);
-    } catch (e) {
-      print('[CycleService] Error getting ride history: $e');
-      return [];
-    }
-  }
-
-  // ============================================================
-  // GET STAND NAME
-  // ============================================================
-
-  static Future<String> getStandName(String standId) async {
-    try {
-      if (standId.isEmpty) return 'Unknown Stand';
-      final response = await _supabase
-          .from('stands')
-          .select('name')
-          .eq('id', standId)
-          .maybeSingle();
-      return response?['name'] ?? 'Stand $standId';
-    } catch (e) {
-      return 'Unknown Stand';
-    }
-  }
-
-  // ============================================================
-  // GET CYCLE DETAILS
-  // ============================================================
-
-  static Future<Map<String, dynamic>?> getCycleDetails(String cycleId) async {
-    try {
-      final response = await _supabase
-          .from('cycles')
-          .select('*, stands!inner(id, name), blocks!inner(name)')
-          .eq('id', cycleId)
-          .maybeSingle();
-      return response;
-    } catch (e) {
-      print('[CycleService] Error getting cycle details: $e');
-      return null;
-    }
-  }
-
-  // ============================================================
-  // VERIFY MAC EXISTS
-  // ============================================================
-
-  static Future<bool> verifyMacExists(String mac) async {
-    try {
-      final result = await getCycleByMac(mac);
-      return result != null;
-    } catch (e) {
-      print('[CycleService] ❌ Error verifying MAC: $e');
-      return false;
-    }
+    return AppException(fallback);
   }
 }

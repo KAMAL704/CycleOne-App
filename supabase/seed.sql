@@ -1,0 +1,2 @@
+-- Optional local-development seed file.
+-- Hardware credentials and stand MAC addresses are intentionally not seeded.

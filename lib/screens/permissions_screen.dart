@@ -10,6 +10,7 @@ class PermissionsScreen extends StatefulWidget {
 
 class _PermissionsScreenState extends State<PermissionsScreen> {
   PermissionStatus _locationStatus = PermissionStatus.denied;
+  PermissionStatus _wifiStatus = PermissionStatus.denied;
 
   @override
   void initState() {
@@ -19,12 +20,16 @@ class _PermissionsScreenState extends State<PermissionsScreen> {
 
   Future<void> _checkStatus() async {
     final status = await Permission.location.status;
-    setState(() => _locationStatus = status);
+    PermissionStatus wifi = PermissionStatus.denied;
+    try { wifi = await Permission.nearbyWifiDevices.status; } on UnsupportedError { wifi = PermissionStatus.granted; }
+    if (mounted) setState(() { _locationStatus = status; _wifiStatus = wifi; });
   }
 
   Future<void> _requestPermission() async {
     final status = await Permission.location.request();
-    setState(() => _locationStatus = status);
+    PermissionStatus wifi = _wifiStatus;
+    try { wifi = await Permission.nearbyWifiDevices.request(); } on UnsupportedError { wifi = PermissionStatus.granted; }
+    if (mounted) setState(() { _locationStatus = status; _wifiStatus = wifi; });
     if (status.isGranted) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Location permission granted!')),
@@ -81,7 +86,7 @@ class _PermissionsScreenState extends State<PermissionsScreen> {
                     const Icon(Icons.location_on, size: 48, color: Colors.orange),
                     const SizedBox(height: 16),
                     const Text(
-                      'Without these permission, the app cannot function',
+                      'Location and nearby Wi-Fi permissions are required for maps and stand locks.',
                       style: TextStyle(fontSize: 16, fontWeight: FontWeight.w500),
                     ),
                     const Text('Please grant the permissions', style: TextStyle(color: Colors.red)),
@@ -96,7 +101,7 @@ class _PermissionsScreenState extends State<PermissionsScreen> {
                         children: [
                           const Icon(Icons.info_outline, color: Colors.blue),
                           const SizedBox(width: 8),
-                          const Expanded(child: Text('The location will be logged for ride tracking')),
+                          const Expanded(child: Text('Location is used to find stands. Nearby Wi-Fi is used to reach the selected lock.')),
                         ],
                       ),
                     ),
@@ -104,7 +109,7 @@ class _PermissionsScreenState extends State<PermissionsScreen> {
                     ElevatedButton.icon(
                       onPressed: _requestPermission,
                       icon: const Icon(Icons.gps_fixed),
-                      label: const Text('Request location permissions'),
+                      label: const Text('Request permissions'),
                       style: ElevatedButton.styleFrom(
                         backgroundColor: Colors.green,
                         minimumSize: const Size(double.infinity, 50),
@@ -121,7 +126,7 @@ class _PermissionsScreenState extends State<PermissionsScreen> {
                       child: Row(
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
-                          const Text('Current Status:'),
+                          const Text('Location:'),
                           Chip(
                             label: Text(_locationStatus.isGranted ? 'Granted' : 'Not Granted'),
                             backgroundColor: _locationStatus.isGranted ? Colors.green : Colors.orange.shade100,
@@ -129,6 +134,11 @@ class _PermissionsScreenState extends State<PermissionsScreen> {
                         ],
                       ),
                     ),
+                    const SizedBox(height: 8),
+                    Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                      const Text('Nearby Wi-Fi:'),
+                      Chip(label: Text(_wifiStatus.isGranted ? 'Granted' : 'Not granted'), backgroundColor: _wifiStatus.isGranted ? Colors.green : Colors.orange.shade100),
+                    ]),
                   ],
                 ),
               ),

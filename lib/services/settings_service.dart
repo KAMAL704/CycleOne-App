@@ -14,4 +14,4 @@ class SettingsService {
       return false;
     }
   }
-}// TODO Implement this library.
+}

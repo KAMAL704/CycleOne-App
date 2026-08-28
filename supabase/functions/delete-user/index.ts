@@ -1,24 +1,30 @@
-import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+import { serve } from 'https://deno.land/std@0.224.0/http/server.ts';
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
-serve(async (req) => {
+const headers = { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'authorization, apikey, content-type' };
+const json = (body: Record<string, unknown>, status = 200) => new Response(JSON.stringify(body), { status, headers });
+
+serve(async (request) => {
+  if (request.method === 'OPTIONS') return new Response('ok', { headers });
   try {
-    const { userId } = await req.json()
-    const supabaseAdmin = createClient(
-      Deno.env.get('URL')!,
-      Deno.env.get('SERVICE_ROLE_KEY')!
-    )
-    // Delete from auth
-    const { error: authError } = await supabaseAdmin.auth.admin.deleteUser(userId)
-    if (authError) throw authError
-    // Delete from profiles
-    const { error: profileError } = await supabaseAdmin
-      .from('profiles')
-      .delete()
-      .eq('id', userId)
-    if (profileError) throw profileError
-    return new Response(JSON.stringify({ success: true }), { status: 200 })
+    const authorization = request.headers.get('Authorization');
+    if (!authorization) return json({ error: 'Authentication required' }, 401);
+    const url = Deno.env.get('SUPABASE_URL')!;
+    const caller = createClient(url, Deno.env.get('SUPABASE_ANON_KEY')!, { global: { headers: { Authorization: authorization } } });
+    const { data: { user } } = await caller.auth.getUser();
+    if (!user) return json({ error: 'Authentication required' }, 401);
+    const admin = createClient(url, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!);
+    const { data: profile } = await admin.from('profiles').select('role, status').eq('id', user.id).maybeSingle();
+    if (profile?.role !== 'admin' || profile.status !== 'active') return json({ error: 'Administrator access required' }, 403);
+    const target = (await request.json()).userId;
+    if (typeof target !== 'string' || target === user.id) return json({ error: 'A different userId is required' }, 400);
+    const { data: activeRide } = await admin.from('rides').select('id').eq('user_id', target).eq('status', 'active').maybeSingle();
+    if (activeRide) return json({ error: 'Cannot delete a user with an active ride' }, 409);
+    const { error } = await admin.auth.admin.deleteUser(target);
+    if (error) return json({ error: error.message }, 400);
+    return json({ success: true });
   } catch (error) {
-    return new Response(JSON.stringify({ error: error.message }), { status: 400 })
+    console.error('[ADMIN] delete-user failed', error instanceof Error ? error.message : 'unknown');
+    return json({ error: 'Request failed' }, 500);
   }
-})
+});

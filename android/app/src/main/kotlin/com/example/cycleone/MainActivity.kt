@@ -4,762 +4,1931 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.net.ConnectivityManager
+import android.net.MacAddress
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.wifi.WifiConfiguration
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
+
 import androidx.annotation.RequiresApi
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
+
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.net.SocketTimeoutException
+import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : FlutterActivity() {
 
+    // ============================================================
+    // CHANNEL / ESP CONFIGURATION
+    // ============================================================
+
     private val CHANNEL = "cycleone/esp_wifi"
+
     private val TAG = "CycleOneNative"
 
-    private val ESP_SSID = "CycleOneS1"
-    private val ESP_PASSWORD = "CycleOne"
-    private val ESP_IP = "10.10.10.10"
-    private val ESP_PORT = 80
+    // Defaults are used only when a legacy stand row omits optional endpoint
+    // fields. The values supplied by Flutter are authoritative for every
+    // connection, so two stands may safely share an SSID.
+    private val DEFAULT_ESP_SSID = "CycleOneS1"
+    private val DEFAULT_ESP_PASSWORD = "CycleOne"
+    private val DEFAULT_ESP_IP = "10.10.10.10"
+    private val DEFAULT_ESP_PORT = 80
+
+    @Volatile private var espSsid = DEFAULT_ESP_SSID
+    @Volatile private var espPassword = DEFAULT_ESP_PASSWORD
+    @Volatile private var espIp = DEFAULT_ESP_IP
+    @Volatile private var espPort = DEFAULT_ESP_PORT
+    @Volatile private var expectedBssid: String? = null
+
+    /*
+     * ESP protocol sizes
+     *
+     * U:
+     *   1 byte status
+     *   40 byte token
+     *   = 41 bytes
+     *
+     * T:
+     *   1 byte status
+     *   40 byte response
+     *   = 41 bytes
+     *
+     * S:
+     *   1 byte status
+     *   1 byte lock state
+     *   = 2 bytes
+     *
+     * P:
+     *   1 byte status
+     *   1 byte lock state
+     *   1 byte physical cycle presence
+     *   = 3 bytes
+     */
+    private val TOKEN_SIZE = 40
 
     private val U_RESPONSE_SIZE = 41
+
     private val T_RESPONSE_SIZE = 41
-    private val TOKEN_SIZE = 40
+
     private val STATUS_RESPONSE_SIZE = 2
 
+    private val PRESENCE_RESPONSE_SIZE = 3
+
+    // ============================================================
+    // ANDROID SERVICES
+    // ============================================================
+
     private var wifiManager: WifiManager? = null
-    private var connectivityManager: ConnectivityManager? = null
+
+    private var connectivityManager:
+            ConnectivityManager? = null
+
+    // ============================================================
+    // SOCKET
+    // ============================================================
+
     private var currentSocket: Socket? = null
+
     private var input: InputStream? = null
+
     private var output: OutputStream? = null
-    private var networkCallback: ConnectivityManager.NetworkCallback? = null
-    private var boundNetwork: Network? = null // ✅ remember the ESP network so we can reconnect on it
+
+    /*
+     * Android 10+ target WiFi network.
+     *
+     * This is important because the phone may still have
+     * mobile data / another WiFi network as default.
+     */
+    private var boundNetwork: Network? = null
+
+    private var networkCallback:
+            ConnectivityManager.NetworkCallback? = null
+
+    // ============================================================
+    // LOCKS
+    // ============================================================
 
     private val socketLock = Any()
+
     private val commandLock = Any()
-    private var connectionResultSent = false
 
-    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
-        super.configureFlutterEngine(flutterEngine)
+    // ============================================================
+    // CONNECTION STATE
+    // ============================================================
 
-        wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-        connectivityManager = applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+    private val connectionResultSent =
+        AtomicBoolean(false)
+
+    // ============================================================
+    // MAIN THREAD HANDLER
+    // ============================================================
+
+    private val handler =
+        Handler(
+            Looper.getMainLooper()
+        )
+
+    // ============================================================
+    // FLUTTER ENGINE
+    // ============================================================
+
+    override fun configureFlutterEngine(
+        flutterEngine: FlutterEngine
+    ) {
+
+        super.configureFlutterEngine(
+            flutterEngine
+        )
+
+        wifiManager =
+            applicationContext
+                .getSystemService(
+                    Context.WIFI_SERVICE
+                ) as WifiManager
+
+        connectivityManager =
+            applicationContext
+                .getSystemService(
+                    Context.CONNECTIVITY_SERVICE
+                ) as ConnectivityManager
 
         MethodChannel(
-            flutterEngine.dartExecutor.binaryMessenger,
+            flutterEngine
+                .dartExecutor
+                .binaryMessenger,
             CHANNEL
-        ).setMethodCallHandler { call, result ->
+        ).setMethodCallHandler {
+
+                call,
+                result ->
+
             when (call.method) {
+
                 "connectToEsp" -> {
-                    if (!checkPermissions()) {
-                        result.error("PERMISSION_DENIED", "Location permission required", null)
-                        return@setMethodCallHandler
-                    }
-                    connectToEsp(call, result)
+
+                    handleConnect(
+                        call,
+                        result
+                    )
                 }
-                "disconnectFromEsp" -> disconnectFromEsp(result)
-                "getConnectionStatus" -> getConnectionStatus(result)
-                "sendU" -> sendU(result)
-                "sendT" -> sendT(call, result)
-                "getStatus" -> getStatus(result)
-                else -> result.notImplemented()
+
+                "disconnectFromEsp" -> {
+
+                    disconnect(
+                        result
+                    )
+                }
+
+                "getConnectionStatus" -> {
+
+                    result.success(
+                        isSocketAlive()
+                    )
+                }
+
+                "sendU" -> {
+
+                    sendU(
+                        result
+                    )
+                }
+
+                "sendT" -> {
+
+                    sendT(
+                        call,
+                        result
+                    )
+                }
+
+                "getStatus" -> {
+
+                    getStatus(
+                        result
+                    )
+                }
+
+                "getPresenceStatus" -> {
+
+                    getPresenceStatus(
+                        result
+                    )
+                }
+
+                else -> {
+
+                    result.notImplemented()
+                }
             }
         }
 
-        Log.d(TAG, "================================")
-        Log.d(TAG, "🚀 CycleOne Native Ready")
-        Log.d(TAG, "📡 SSID: $ESP_SSID")
-        Log.d(TAG, "🌐 ESP: $ESP_IP:$ESP_PORT")
-        Log.d(TAG, "📱 Android Version: ${Build.VERSION.SDK_INT}")
-        Log.d(TAG, "================================")
+        Log.d(
+            TAG,
+            "================================"
+        )
+
+        Log.d(
+            TAG,
+            "CycleOne native bridge ready"
+        )
+
+        Log.d(
+            TAG,
+            "SSID: $espSsid"
+        )
+
+        Log.d(
+            TAG,
+            "IP: $espIp"
+        )
+
+        Log.d(
+            TAG,
+            "PORT: $espPort"
+        )
+
+        Log.d(
+            TAG,
+            "================================"
+        )
     }
 
-    private fun checkPermissions(): Boolean {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            val permissions = mutableListOf<String>()
+    // ============================================================
+    // PERMISSION
+    // ============================================================
 
-            if (ContextCompat.checkSelfPermission(
-                    this,
-                    Manifest.permission.ACCESS_FINE_LOCATION
-                ) != PackageManager.PERMISSION_GRANTED
+    private fun hasLocationPermission():
+            Boolean {
+
+        return if (
+            Build.VERSION.SDK_INT >=
+            Build.VERSION_CODES.M
+        ) {
+
+            ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.ACCESS_FINE_LOCATION
+            ) ==
+                    PackageManager.PERMISSION_GRANTED
+
+        } else {
+
+            true
+        }
+    }
+
+    private fun requestLocationPermission():
+            Boolean {
+
+        if (
+            Build.VERSION.SDK_INT >=
+            Build.VERSION_CODES.M
+        ) {
+
+            if (
+                !hasLocationPermission()
             ) {
-                permissions.add(Manifest.permission.ACCESS_FINE_LOCATION)
-            }
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
-                ContextCompat.checkSelfPermission(
-                    this,
-                    Manifest.permission.ACCESS_BACKGROUND_LOCATION
-                ) != PackageManager.PERMISSION_GRANTED
-            ) {
-                permissions.add(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
-            }
-
-            if (permissions.isNotEmpty()) {
                 ActivityCompat.requestPermissions(
                     this,
-                    permissions.toTypedArray(),
+                    arrayOf(
+                        Manifest.permission.ACCESS_FINE_LOCATION
+                    ),
                     1001
                 )
+
                 return false
             }
         }
+
         return true
     }
 
     // ============================================================
-    // CONNECT TO ESP
+    // CONNECT ENTRY
     // ============================================================
 
-    private fun connectToEsp(call: MethodCall, result: MethodChannel.Result) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            connectToEspAndroid10Plus(result)
+    private fun handleConnect(
+        call: MethodCall,
+        result: MethodChannel.Result
+    ) {
+
+        if (
+            !requestLocationPermission()
+        ) {
+
+            result.error(
+                "PERMISSION_DENIED",
+                "Location permission is required for WiFi connection.",
+                null
+            )
+
             return
         }
-        connectToEspOldAndroid(result)
+
+        val mac =
+            call.argument<String>(
+                "mac"
+            )
+                ?.trim()
+                ?.uppercase()
+
+        if (
+            mac.isNullOrEmpty()
+        ) {
+
+            result.error(
+                "INVALID_MAC",
+                "ESP MAC is required.",
+                null
+            )
+
+            return
+        }
+
+        /*
+         * Validate MAC format before Android API.
+         */
+        if (
+            !isValidMac(
+                mac
+            )
+        ) {
+
+            result.error(
+                "INVALID_MAC",
+                "Invalid ESP MAC: $mac",
+                null
+            )
+
+            return
+        }
+
+        val requestedSsid = call.argument<String>("ssid")?.trim().orEmpty()
+        val requestedPassword = call.argument<String>("password")?.trim().orEmpty()
+        val requestedIp = call.argument<String>("ip")?.trim().orEmpty()
+        val requestedPort = call.argument<Int>("port") ?: DEFAULT_ESP_PORT
+        if (requestedSsid.isEmpty() || requestedPassword.isEmpty() || requestedIp.isEmpty() || requestedPort !in 1..65535) {
+            result.error("INVALID_ENDPOINT", "The stand has an invalid ESP endpoint.", null)
+            return
+        }
+        espSsid = requestedSsid
+        espPassword = requestedPassword
+        espIp = requestedIp
+        espPort = requestedPort
+        expectedBssid = mac
+
+        Log.d(
+            TAG,
+            "================================"
+        )
+
+        Log.d(
+            TAG,
+            "Connecting to ESP"
+        )
+
+        Log.d(
+            TAG,
+            "SSID=$espSsid"
+        )
+
+        Log.d(
+            TAG,
+            "BSSID=$mac"
+        )
+
+        Log.d(
+            TAG,
+            "IP=$espIp"
+        )
+
+        Log.d(
+            TAG,
+            "================================"
+        )
+
+        if (
+            Build.VERSION.SDK_INT >=
+            Build.VERSION_CODES.Q
+        ) {
+
+            connectAndroid10Plus(result)
+
+        } else {
+
+            connectOlderAndroid(result)
+        }
     }
 
+    // ============================================================
+    // MAC VALIDATION
+    // ============================================================
+
+    private fun isValidMac(
+        mac: String
+    ): Boolean {
+
+        return Regex(
+            "^([0-9A-F]{2}:){5}[0-9A-F]{2}$"
+        ).matches(
+            mac.uppercase()
+        )
+    }
+
+    // ============================================================
+    // ANDROID 10+
+    // ============================================================
+
     @RequiresApi(Build.VERSION_CODES.Q)
-    private fun connectToEspAndroid10Plus(result: MethodChannel.Result) {
+    private fun connectAndroid10Plus(
+        result: MethodChannel.Result
+    ) {
+
         try {
-            Log.d(TAG, "================================")
-            Log.d(TAG, "🔗 Android 10+: Connecting to ESP")
-            Log.d(TAG, "📡 SSID: $ESP_SSID")
-            Log.d(TAG, "🌐 $ESP_IP:$ESP_PORT")
-            Log.d(TAG, "================================")
 
             closeSocket()
-            connectionResultSent = false
-
-            Log.d(TAG, "📡 Android 10+: Building NetworkSpecifier...")
-
-            val networkSpecifier = android.net.wifi.WifiNetworkSpecifier.Builder()
-                .setSsid(ESP_SSID)
-                .setWpa2Passphrase(ESP_PASSWORD)
-                .build()
-
-            val networkRequest = NetworkRequest.Builder()
-                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
-                .setNetworkSpecifier(networkSpecifier)
-                .build()
 
             unregisterNetworkCallback()
 
-            networkCallback = object : ConnectivityManager.NetworkCallback() {
-                override fun onAvailable(network: Network) {
-                    Log.d(TAG, "✅ Android 10+: WiFi Network available!")
-                    boundNetwork = network // ✅ keep a handle so sendU/sendT can reconnect fresh
-                    if (!connectionResultSent) {
-                        connectionResultSent = true
-                        connectSocketWithNetwork(network, result)
-                    }
-                }
+            boundNetwork =
+                null
 
-                override fun onUnavailable() {
-                    Log.e(TAG, "❌ Android 10+: Network unavailable")
-                    if (!connectionResultSent) {
-                        connectionResultSent = true
-                        handler.post {
-                            result.error("WIFI_UNAVAILABLE", "ESP WiFi unavailable. Make sure ESP is powered ON.", null)
+            connectionResultSent.set(
+                false
+            )
+
+            Log.d(
+                TAG,
+                "Creating WifiNetworkSpecifier"
+            )
+
+            val specifier =
+                android.net.wifi
+                    .WifiNetworkSpecifier
+                    .Builder()
+                    .setSsid(
+                        espSsid
+                    )
+                    .setWpa2Passphrase(
+                        espPassword
+                    )
+                    .setBssid(
+                        MacAddress.fromString(expectedBssid!!)
+                    )
+                    .build()
+
+            val request =
+                NetworkRequest.Builder()
+                    .addTransportType(
+                        NetworkCapabilities
+                            .TRANSPORT_WIFI
+                    )
+                    .setNetworkSpecifier(
+                        specifier
+                    )
+                    .build()
+
+            networkCallback =
+                object :
+                    ConnectivityManager
+                    .NetworkCallback() {
+
+                    override fun onAvailable(
+                        network: Network
+                    ) {
+
+                        Log.d(
+                            TAG,
+                            "Target WiFi available"
+                        )
+
+                        boundNetwork =
+                            network
+
+                        if (
+                            connectionResultSent
+                                .compareAndSet(
+                                    false,
+                                    true
+                                )
+                        ) {
+
+                            connectSocketUsingNetwork(
+                                network,
+                                result
+                            )
                         }
                     }
-                }
 
-                override fun onLost(network: Network) {
-                    Log.w(TAG, "⚠️ Android 10+: Network lost")
-                    closeSocket()
-                    boundNetwork = null
-                    unregisterNetworkCallback()
-                }
-            }
+                    override fun onUnavailable() {
 
-            connectivityManager?.requestNetwork(networkRequest, networkCallback!!)
-            Log.d(TAG, "📡 Network request sent, waiting for connection...")
+                        Log.e(
+                            TAG,
+                            "Target ESP unavailable"
+                        )
 
-            handler.postDelayed({
-                if (!connectionResultSent && !isSocketAlive()) {
-                    connectionResultSent = true
-                    Log.e(TAG, "⏰ Android 10+: Connection timeout")
-                    unregisterNetworkCallback()
-                    handler.post {
-                        result.error("WIFI_TIMEOUT",
-                            "Connection timeout. Make sure ESP is powered ON and in range.",
-                            null)
+                        if (
+                            connectionResultSent
+                                .compareAndSet(
+                                    false,
+                                    true
+                                )
+                        ) {
+
+                            unregisterNetworkCallback()
+
+                            result.error(
+                                "WIFI_UNAVAILABLE",
+                                "Target ESP WiFi is unavailable.",
+                                null
+                            )
+                        }
+                    }
+
+                    override fun onLost(
+                        network: Network
+                    ) {
+
+                        Log.w(
+                            TAG,
+                            "ESP WiFi lost"
+                        )
+
+                        if (
+                            boundNetwork ==
+                            network
+                        ) {
+
+                            boundNetwork =
+                                null
+                        }
+
+                        closeSocket()
                     }
                 }
-            }, 25000)
 
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ Android 10+ connection error", e)
-            if (!connectionResultSent) {
-                connectionResultSent = true
-                handler.post {
-                    result.error("WIFI_ERROR", e.message ?: "Connection failed", null)
-                }
+            connectivityManager
+                ?.requestNetwork(
+                    request,
+                    networkCallback!!
+                )
+
+            /*
+             * Connection timeout.
+             */
+            handler.postDelayed(
+                {
+
+                    if (
+                        connectionResultSent
+                            .compareAndSet(
+                                false,
+                                true
+                            )
+                    ) {
+
+                        Log.e(
+                            TAG,
+                            "ESP WiFi connection timeout"
+                        )
+
+                        unregisterNetworkCallback()
+
+                        result.error(
+                            "WIFI_TIMEOUT",
+                            "Target ESP was not found.",
+                            null
+                        )
+                    }
+
+                },
+                25000
+            )
+
+        } catch (
+            e: Exception
+        ) {
+
+            Log.e(
+                TAG,
+                "WiFi connection error",
+                e
+            )
+
+            if (
+                connectionResultSent
+                    .compareAndSet(
+                        false,
+                        true
+                    )
+            ) {
+
+                result.error(
+                    "WIFI_ERROR",
+                    e.message
+                        ?: "WiFi connection error",
+                    null
+                )
             }
         }
     }
+
+    // ============================================================
+    // SOCKET USING TARGET NETWORK
+    // ============================================================
 
     @RequiresApi(Build.VERSION_CODES.Q)
-    private fun connectSocketWithNetwork(network: Network, result: MethodChannel.Result) {
-        try {
-            Log.d(TAG, "🔌 Creating ESP TCP socket with network binding...")
+    private fun connectSocketUsingNetwork(
+        network: Network,
+        result: MethodChannel.Result
+    ) {
 
-            val socket = Socket()
-            network.bindSocket(socket)
-            socket.connect(InetSocketAddress(ESP_IP, ESP_PORT), 5000)
-            socket.soTimeout = 5000
-            socket.keepAlive = true
-            socket.tcpNoDelay = true
-            socket.setSoLinger(true, 0)
-
-            currentSocket = socket
-            input = socket.getInputStream()
-            output = socket.getOutputStream()
-
-            Log.d(TAG, "================================")
-            Log.d(TAG, "✅ TCP SOCKET CONNECTED")
-            Log.d(TAG, "🌐 $ESP_IP:$ESP_PORT")
-            Log.d(TAG, "================================")
-
-            handler.post {
-                result.success(true)
-            }
-
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ Socket creation failed", e)
-            closeSocket()
-            handler.post {
-                result.error("SOCKET_ERROR", e.message ?: "Socket connection failed", null)
-            }
-        }
-    }
-
-    private fun connectToEspOldAndroid(result: MethodChannel.Result) {
         Thread {
+
             try {
-                Log.d(TAG, "================================")
-                Log.d(TAG, "🔗 Android 9-: Connecting to ESP")
-                Log.d(TAG, "📡 SSID: $ESP_SSID")
-                Log.d(TAG, "🌐 $ESP_IP:$ESP_PORT")
-                Log.d(TAG, "================================")
+
+                val socket =
+                    Socket()
+
+                /*
+                 * CRITICAL:
+                 *
+                 * Bind socket to the selected ESP network.
+                 *
+                 * This prevents Android from sending
+                 * 10.10.10.10 through mobile/default network.
+                 */
+                network.bindSocket(
+                    socket
+                )
+
+                socket.connect(
+                    InetSocketAddress(
+                        espIp,
+                        espPort
+                    ),
+                    10000
+                )
+
+                socket.soTimeout =
+                    10000
+
+                socket.keepAlive =
+                    true
+
+                socket.tcpNoDelay =
+                    true
+
+                synchronized(
+                    socketLock
+                ) {
+
+                    currentSocket =
+                        socket
+
+                    input =
+                        socket.getInputStream()
+
+                    output =
+                        socket.getOutputStream()
+                }
+
+                Log.d(
+                    TAG,
+                    "TCP socket connected to $espIp:$espPort"
+                )
+
+                handler.post {
+
+                    result.success(
+                        true
+                    )
+                }
+
+            } catch (
+                e: Exception
+            ) {
+
+                Log.e(
+                    TAG,
+                    "Socket connection error",
+                    e
+                )
 
                 closeSocket()
 
-                if (!wifiManager!!.isWifiEnabled) {
-                    Log.e(TAG, "❌ WiFi is disabled")
-                    handler.post {
-                        result.error("WIFI_DISABLED", "WiFi is disabled", null)
-                    }
-                    return@Thread
-                }
-
-                val currentWifi = wifiManager!!.connectionInfo
-                if (currentWifi != null && currentWifi.ssid == "\"$ESP_SSID\"") {
-                    Log.d(TAG, "✅ Already connected to ESP WiFi")
-                    connectSocket(result)
-                    return@Thread
-                }
-
-                val existingNetworks = wifiManager!!.configuredNetworks
-                for (network in existingNetworks) {
-                    if (network.SSID == "\"$ESP_SSID\"") {
-                        wifiManager!!.removeNetwork(network.networkId)
-                        wifiManager!!.saveConfiguration()
-                    }
-                }
-
-                val config = WifiConfiguration()
-                config.SSID = "\"$ESP_SSID\""
-                config.preSharedKey = "\"$ESP_PASSWORD\""
-                config.status = WifiConfiguration.Status.ENABLED
-
-                config.allowedGroupCiphers.set(WifiConfiguration.GroupCipher.TKIP)
-                config.allowedGroupCiphers.set(WifiConfiguration.GroupCipher.CCMP)
-                config.allowedKeyManagement.set(WifiConfiguration.KeyMgmt.WPA_PSK)
-                config.allowedPairwiseCiphers.set(WifiConfiguration.PairwiseCipher.TKIP)
-                config.allowedPairwiseCiphers.set(WifiConfiguration.PairwiseCipher.CCMP)
-                config.allowedProtocols.set(WifiConfiguration.Protocol.RSN)
-                config.allowedProtocols.set(WifiConfiguration.Protocol.WPA)
-
-                val networkId = wifiManager!!.addNetwork(config)
-                if (networkId == -1) {
-                    Log.e(TAG, "❌ Failed to add WiFi network")
-                    handler.post {
-                        result.error("WIFI_ADD_FAILED", "Failed to add WiFi network", null)
-                    }
-                    return@Thread
-                }
-
-                Log.d(TAG, "✅ Network added with ID: $networkId")
-                wifiManager!!.disconnect()
-                wifiManager!!.enableNetwork(networkId, true)
-                wifiManager!!.reconnect()
-
-                var attempts = 0
-                while (attempts < 30) {
-                    Thread.sleep(500)
-                    val info = wifiManager!!.connectionInfo
-                    if (info != null && info.ssid == "\"$ESP_SSID\"") {
-                        Log.d(TAG, "✅ Connected to ESP WiFi")
-                        connectSocket(result)
-                        return@Thread
-                    }
-                    attempts++
-                }
-
-                Log.e(TAG, "❌ Failed to connect to ESP WiFi (timeout)")
                 handler.post {
-                    result.error("WIFI_CONNECT_TIMEOUT", "Failed to connect to ESP WiFi", null)
-                }
 
-            } catch (e: Exception) {
-                Log.e(TAG, "❌ Connection error", e)
-                handler.post {
-                    result.error("CONNECTION_ERROR", e.message ?: "Connection failed", null)
+                    result.error(
+                        "SOCKET_ERROR",
+                        e.message
+                            ?: "Unable to connect TCP socket.",
+                        null
+                    )
                 }
             }
         }.start()
     }
 
-    private fun connectSocket(result: MethodChannel.Result) {
-        try {
-            Log.d(TAG, "🔌 Creating ESP TCP socket...")
+    // ============================================================
+    // OLD ANDROID
+    // ============================================================
 
-            val socket = Socket()
-            socket.connect(InetSocketAddress(ESP_IP, ESP_PORT), 5000)
-            socket.soTimeout = 5000
-            socket.keepAlive = true
-            socket.tcpNoDelay = true
-            socket.setSoLinger(true, 0)
+    private fun connectOlderAndroid(result: MethodChannel.Result) {
 
-            currentSocket = socket
-            input = socket.getInputStream()
-            output = socket.getOutputStream()
+        Thread {
 
-            Log.d(TAG, "================================")
-            Log.d(TAG, "✅ TCP SOCKET CONNECTED")
-            Log.d(TAG, "🌐 $ESP_IP:$ESP_PORT")
-            Log.d(TAG, "================================")
+            try {
 
-            handler.post {
-                result.success(true)
+                val manager =
+                    wifiManager
+
+                if (
+                    manager == null ||
+                    !manager.isWifiEnabled
+                ) {
+
+                    handler.post {
+
+                        result.error(
+                            "WIFI_DISABLED",
+                            "WiFi is disabled.",
+                            null
+                        )
+                    }
+
+                    return@Thread
+                }
+
+                closeSocket()
+
+                val info =
+                    manager.connectionInfo
+
+                if (
+                    info != null &&
+                    info.ssid == "\"$espSsid\""
+                ) {
+
+                    if (info.bssid?.uppercase() != expectedBssid) {
+                        handler.post { result.error("BSSID_MISMATCH", "A different stand is already connected.", null) }
+                        return@Thread
+                    }
+
+                    Log.d(
+                        TAG,
+                        "Already connected to $espSsid"
+                    )
+
+                    connectOldSocket(
+                        result
+                    )
+
+                    return@Thread
+                }
+
+                val networks =
+                    manager.configuredNetworks
+                        ?: emptyList()
+
+                for (
+                network in networks
+                ) {
+
+                    if (network.SSID == "\"$espSsid\"") {
+
+                        manager.removeNetwork(
+                            network.networkId
+                        )
+                    }
+                }
+
+                val config =
+                    WifiConfiguration()
+
+                config.SSID =
+                    "\"$espSsid\""
+
+                config.preSharedKey =
+                    "\"$espPassword\""
+
+                config.allowedKeyManagement.set(
+                    WifiConfiguration
+                        .KeyMgmt.WPA_PSK
+                )
+
+                val networkId =
+                    manager.addNetwork(
+                        config
+                    )
+
+                if (
+                    networkId < 0
+                ) {
+
+                    handler.post {
+
+                        result.error(
+                            "WIFI_ADD_FAILED",
+                            "Could not configure ESP WiFi.",
+                            null
+                        )
+                    }
+
+                    return@Thread
+                }
+
+                manager.disconnect()
+
+                manager.enableNetwork(
+                    networkId,
+                    true
+                )
+
+                manager.reconnect()
+
+                var attempt = 0
+
+                while (
+                    attempt < 40
+                ) {
+
+                    Thread.sleep(
+                        500
+                    )
+
+                    val current =
+                        manager.connectionInfo
+
+                    if (
+                        current != null &&
+                        current.ssid == "\"$espSsid\""
+                    ) {
+
+                        Log.d(
+                            TAG,
+                            "Connected to $espSsid"
+                        )
+
+                        val bssid = current.bssid?.uppercase()
+                        if (bssid == null || bssid != expectedBssid) {
+                            handler.post { result.error("BSSID_MISMATCH", "A different stand answered the Wi-Fi request.", null) }
+                            return@Thread
+                        }
+
+                        connectOldSocket(
+                            result
+                        )
+
+                        return@Thread
+                    }
+
+                    attempt++
+                }
+
+                handler.post {
+
+                    result.error(
+                        "WIFI_TIMEOUT",
+                        "Could not connect to ESP WiFi.",
+                        null
+                    )
+                }
+
+            } catch (
+                e: Exception
+            ) {
+
+                Log.e(
+                    TAG,
+                    "Old Android WiFi error",
+                    e
+                )
+
+                handler.post {
+
+                    result.error(
+                        "WIFI_ERROR",
+                        e.message
+                            ?: "WiFi error",
+                        null
+                    )
+                }
             }
 
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ Socket creation failed", e)
-            closeSocket()
+        }.start()
+    }
+
+    // ============================================================
+    // OLD ANDROID SOCKET
+    // ============================================================
+
+    private fun connectOldSocket(
+        result: MethodChannel.Result
+    ) {
+
+        try {
+
+            val socket =
+                Socket()
+
+            socket.connect(
+                InetSocketAddress(espIp, espPort),
+                10000
+            )
+
+            socket.soTimeout =
+                10000
+
+            socket.keepAlive =
+                true
+
+            socket.tcpNoDelay =
+                true
+
+            synchronized(
+                socketLock
+            ) {
+
+                currentSocket =
+                    socket
+
+                input =
+                    socket.getInputStream()
+
+                output =
+                    socket.getOutputStream()
+            }
+
+            Log.d(
+                TAG,
+                "Old Android TCP socket connected"
+            )
+
             handler.post {
-                result.error("SOCKET_ERROR", e.message ?: "Socket connection failed", null)
+
+                result.success(
+                    true
+                )
+            }
+
+        } catch (
+            e: Exception
+        ) {
+
+            Log.e(
+                TAG,
+                "Old Android socket error",
+                e
+            )
+
+            closeSocket()
+
+            handler.post {
+
+                result.error(
+                    "SOCKET_ERROR",
+                    e.message
+                        ?: "Socket connection failed.",
+                    null
+                )
             }
         }
     }
 
     // ============================================================
-    // ✅ SEND U — FIXED: close + reconnect fresh between failed attempts
+    // SEND U
     // ============================================================
 
-    private fun sendU(result: MethodChannel.Result) {
+    private fun sendU(
+        result: MethodChannel.Result
+    ) {
+
         Thread {
-            synchronized(commandLock) {
+
+            synchronized(
+                commandLock
+            ) {
+
                 try {
-                    Log.d(TAG, "================================")
-                    Log.d(TAG, "📤 SEND U")
-                    Log.d(TAG, "================================")
 
-                    var tokenList: List<Int>? = null
-                    var attempts = 0
-                    val maxAttempts = 4 // ✅ one extra attempt, since fresh connects are cheap
+                    if (
+                        !isSocketAlive()
+                    ) {
 
-                    while (attempts < maxAttempts && tokenList == null) {
-                        attempts++
-                        Log.d(TAG, "🔄 Attempt $attempts/$maxAttempts")
+                        Log.w(
+                            TAG,
+                            "Socket not alive. Reconnecting..."
+                        )
 
-                        // ✅ FIX: on every retry (not just the first), make sure we have a
-                        // socket the ESP hasn't already silently dropped. isSocketAlive()
-                        // only reflects LOCAL TCP state — it can't see that the ESP's
-                        // WiFiClient already went out of scope and reset the connection.
-                        if (!isSocketAlive()) {
-                            Log.d(TAG, "🔌 Socket not alive, reconnecting...")
-                            closeSocket()
-                            Thread.sleep(100)
-                            if (!reconnectTcp()) {
-                                Log.e(TAG, "❌ Failed to connect")
-                                Thread.sleep(200)
-                                continue
+                        if (
+                            !reconnectTcp()
+                        ) {
+
+                            handler.post {
+
+                                result.error(
+                                    "ESP_CONNECTION",
+                                    "ESP connection lost.",
+                                    null
+                                )
                             }
-                        } else {
-                            Log.d(TAG, "✅ Using existing connection")
-                        }
 
-                        val socketInput = input
-                        val socketOutput = output
-
-                        if (socketInput == null || socketOutput == null) {
-                            Log.e(TAG, "❌ Streams null")
-                            closeSocket()
-                            Thread.sleep(200)
-                            continue
-                        }
-
-                        try {
-                            while (socketInput.available() > 0) {
-                                socketInput.read()
-                            }
-                            Log.d(TAG, "🧹 Buffer cleared")
-                        } catch (_: Exception) {}
-
-                        var readFailed = false
-
-                        try {
-                            Log.d(TAG, "📤 Sending 'U' command...")
-                            socketOutput.write('U'.code)
-                            socketOutput.flush()
-                            Log.d(TAG, "✅ 'U' command sent")
-
-                            Log.d(TAG, "📥 Reading 41 bytes...")
-                            val response = readExactFast(socketInput, U_RESPONSE_SIZE, 2000)
-
-                            if (response != null && response.isNotEmpty()) {
-                                Log.d(TAG, "📥 Response size: ${response.size} bytes")
-
-                                if (response.size == U_RESPONSE_SIZE) {
-                                    val status = response[0].toInt() and 0xFF
-                                    Log.d(TAG, "📥 ESP status byte: $status")
-
-                                    if (status == 0) {
-                                        val tokenBytes = response.copyOfRange(1, response.size)
-                                        tokenList = tokenBytes.map { it.toInt() and 0xFF }
-                                        Log.d(TAG, "✅ Token received: ${tokenList.size} bytes")
-                                    } else {
-                                        Log.e(TAG, "❌ ESP error status: $status")
-                                        readFailed = true
-                                    }
-                                } else if (response.size == TOKEN_SIZE) {
-                                    tokenList = response.map { it.toInt() and 0xFF }
-                                    Log.d(TAG, "✅ Token received (no status): ${tokenList.size} bytes")
-                                } else {
-                                    Log.e(TAG, "❌ Unexpected response size: ${response.size}")
-                                    readFailed = true
-                                }
-                            } else {
-                                // ✅ This is the case from your log: EOF / 0 bytes.
-                                // The ESP has already reset the connection.
-                                Log.e(TAG, "❌ Empty response — ESP likely dropped the connection")
-                                readFailed = true
-                            }
-                        } catch (e: Exception) {
-                            // ✅ This is the "Broken pipe" case from your log.
-                            Log.e(TAG, "❌ Write/Read error: ${e.message}")
-                            readFailed = true
-                        }
-
-                        // ✅ THE ACTUAL FIX: whenever this attempt failed, force-close the
-                        // socket now so the NEXT loop iteration's isSocketAlive() check
-                        // correctly returns false and triggers a real reconnectTcp(),
-                        // instead of retrying on a connection the ESP already killed.
-                        if (readFailed || tokenList == null) {
-                            closeSocket()
-                        }
-
-                        if (tokenList == null && attempts < maxAttempts) {
-                            Log.d(TAG, "⏳ Retrying in 300ms...")
-                            Thread.sleep(300)
+                            return@synchronized
                         }
                     }
 
-                    if (tokenList == null) {
-                        Log.e(TAG, "❌ Failed to get token after $maxAttempts attempts")
-                        closeSocket()
+                    val inputStream =
+                        input
+
+                    val outputStream =
+                        output
+
+                    if (
+                        inputStream == null ||
+                        outputStream == null
+                    ) {
+
                         handler.post {
-                            result.error("ESP_U_RESPONSE_ERROR", "Failed to get token after retries", null)
+
+                            result.error(
+                                "ESP_STREAM",
+                                "ESP stream unavailable.",
+                                null
+                            )
                         }
+
+                        return@synchronized
+                    }
+
+                    /*
+                     * Remove only stale bytes that were already
+                     * waiting before this command.
+                     */
+                    clearInput(
+                        inputStream
+                    )
+
+                    Log.d(
+                        TAG,
+                        "Sending U command"
+                    )
+
+                    outputStream.write(
+                        'U'.code
+                    )
+
+                    outputStream.flush()
+
+                    /*
+                     * ESP firmware:
+                     *
+                     * client.write(0);
+                     * client.write(respArr, 40);
+                     *
+                     * TOTAL = 41 bytes
+                     */
+                    val response =
+                        readExact(
+                            inputStream,
+                            U_RESPONSE_SIZE,
+                            8000
+                        )
+
+                    if (
+                        response == null ||
+                        response.size !=
+                        U_RESPONSE_SIZE
+                    ) {
+
+                        Log.e(
+                            TAG,
+                            "Invalid U response. Expected=$U_RESPONSE_SIZE"
+                        )
+
+                        handler.post {
+
+                            result.error(
+                                "ESP_U_RESPONSE",
+                                "Invalid U response. Expected 41 bytes.",
+                                null
+                            )
+                        }
+
+                        return@synchronized
+                    }
+
+                    Log.d(
+                        TAG,
+                        "U response received: ${response.size} bytes"
+                    )
+
+                    val status =
+                        response[0]
+                            .toInt()
+                            .and(0xFF)
+
+                    Log.d(
+                        TAG,
+                        "U status byte=$status"
+                    )
+
+                    /*
+                     * Flutter ESPLockService accepts:
+                     *
+                     * 41 bytes:
+                     *   status + token
+                     *
+                     * or it can extract the 40-byte token.
+                     *
+                     * We return the complete 41-byte response
+                     * because the Dart code already handles it.
+                     */
+                    handler.post {
+
+                        result.success(
+                            response.toList()
+                        )
+                    }
+
+                } catch (
+                    e: SocketTimeoutException
+                ) {
+
+                    Log.e(
+                        TAG,
+                        "U response timeout",
+                        e
+                    )
+
+                    closeSocket()
+
+                    handler.post {
+
+                        result.error(
+                            "ESP_U_TIMEOUT",
+                            "ESP did not return a complete U response.",
+                            null
+                        )
+                    }
+
+                } catch (
+                    e: Exception
+                ) {
+
+                    Log.e(
+                        TAG,
+                        "U command error",
+                        e
+                    )
+
+                    closeSocket()
+
+                    handler.post {
+
+                        result.error(
+                            "ESP_U_ERROR",
+                            e.message
+                                ?: "Unknown U error.",
+                            null
+                        )
+                    }
+                }
+            }
+
+        }.start()
+    }
+
+    // ============================================================
+    // SEND T
+    // ============================================================
+
+    private fun sendT(
+        call: MethodCall,
+        result: MethodChannel.Result
+    ) {
+
+        Thread {
+
+            synchronized(
+                commandLock
+            ) {
+
+                try {
+
+                    val token =
+                        call.argument<List<Int>>(
+                            "token"
+                        )
+
+                    if (
+                        token == null ||
+                        token.size !=
+                        TOKEN_SIZE
+                    ) {
+
+                        handler.post {
+
+                            result.error(
+                                "INVALID_TOKEN",
+                                "Token must be exactly 40 bytes.",
+                                null
+                            )
+                        }
+
+                        return@synchronized
+                    }
+
+                    if (
+                        !isSocketAlive()
+                    ) {
+
+                        Log.w(
+                            TAG,
+                            "Socket not alive before T. Reconnecting..."
+                        )
+
+                        if (
+                            !reconnectTcp()
+                        ) {
+
+                            handler.post {
+
+                                result.error(
+                                    "ESP_CONNECTION",
+                                    "ESP connection lost.",
+                                    null
+                                )
+                            }
+
+                            return@synchronized
+                        }
+                    }
+
+                    val inputStream =
+                        input
+
+                    val outputStream =
+                        output
+
+                    if (
+                        inputStream == null ||
+                        outputStream == null
+                    ) {
+
+                        handler.post {
+
+                            result.error(
+                                "ESP_STREAM",
+                                "ESP stream unavailable.",
+                                null
+                            )
+                        }
+
+                        return@synchronized
+                    }
+
+                    clearInput(
+                        inputStream
+                    )
+
+                    /*
+                     * Packet:
+                     *
+                     * 1 byte  = T
+                     * 40 bytes = transformed token
+                     *
+                     * TOTAL = 41 bytes
+                     */
+                    val packet =
+                        ByteArray(
+                            1 + TOKEN_SIZE
+                        )
+
+                    packet[0] =
+                        'T'.code.toByte()
+
+                    for (
+                    i in 0 until TOKEN_SIZE
+                    ) {
+
+                        packet[i + 1] =
+                            token[i].toByte()
+                    }
+
+                    Log.d(
+                        TAG,
+                        "Sending T command: ${packet.size} bytes"
+                    )
+
+                    outputStream.write(
+                        packet
+                    )
+
+                    outputStream.flush()
+
+                    /*
+                     * ESP handleTrigger() eventually calls:
+                     *
+                     * sendStatusWithoutRfidPing()
+                     *
+                     * which returns:
+                     *
+                     * 1 status byte
+                     * +
+                     * 40 bytes
+                     *
+                     * = 41 bytes
+                     */
+                    val response =
+                        readExact(
+                            inputStream,
+                            T_RESPONSE_SIZE,
+                            8000
+                        )
+
+                    if (
+                        response == null ||
+                        response.size !=
+                        T_RESPONSE_SIZE
+                    ) {
+
+                        Log.e(
+                            TAG,
+                            "Invalid T response"
+                        )
+
+                        // The relay may already have acted. Force a fresh
+                        // socket so the Dart layer can perform a status-only
+                        // recovery check; never reuse a desynchronised stream.
+                        closeSocket()
+
+                        handler.post {
+
+                            result.error(
+                                "ESP_T_RESPONSE",
+                                "Invalid T response. Expected 41 bytes.",
+                                null
+                            )
+                        }
+
+                        return@synchronized
+                    }
+
+                    val status =
+                        response[0]
+                            .toInt()
+                            .and(0xFF)
+
+                    Log.d(
+                        TAG,
+                        "T response received: ${response.size} bytes"
+                    )
+
+                    Log.d(
+                        TAG,
+                        "T status=$status"
+                    )
+
+                    /*
+                     * ESP status:
+                     *
+                     * 0 = success
+                     * 1 = error
+                     */
+                    handler.post {
+
+                        result.success(
+                            status == 0
+                        )
+                    }
+
+                } catch (
+                    e: SocketTimeoutException
+                ) {
+
+                    Log.e(
+                        TAG,
+                        "T response timeout",
+                        e
+                    )
+
+                    closeSocket()
+
+                    handler.post {
+
+                        result.error(
+                            "ESP_T_TIMEOUT",
+                            "ESP did not return a complete T response.",
+                            null
+                        )
+                    }
+
+                } catch (
+                    e: Exception
+                ) {
+
+                    Log.e(
+                        TAG,
+                        "T command error",
+                        e
+                    )
+
+                    closeSocket()
+
+                    handler.post {
+
+                        result.error(
+                            "ESP_T_ERROR",
+                            e.message
+                                ?: "Unknown T error.",
+                            null
+                        )
+                    }
+                }
+            }
+
+        }.start()
+    }
+
+    // ============================================================
+    // STATUS
+    // ============================================================
+
+    private fun getStatus(
+        result: MethodChannel.Result
+    ) {
+
+        Thread {
+
+            synchronized(
+                commandLock
+            ) {
+
+                try {
+
+                    if (
+                        !isSocketAlive()
+                    ) {
+
+                        Log.w(
+                            TAG,
+                            "Socket not alive before S. Reconnecting..."
+                        )
+
+                        if (
+                            !reconnectTcp()
+                        ) {
+
+                            handler.post {
+
+                                result.error(
+                                    "ESP_CONNECTION",
+                                    "ESP not connected.",
+                                    null
+                                )
+                            }
+
+                            return@synchronized
+                        }
+                    }
+
+                    val inputStream =
+                        input
+
+                    val outputStream =
+                        output
+
+                    if (
+                        inputStream == null ||
+                        outputStream == null
+                    ) {
+
+                        handler.post {
+
+                            result.error(
+                                "ESP_STREAM",
+                                "ESP stream unavailable.",
+                                null
+                            )
+                        }
+
+                        return@synchronized
+                    }
+
+                    clearInput(
+                        inputStream
+                    )
+
+                    Log.d(
+                        TAG,
+                        "Sending S command"
+                    )
+
+                    outputStream.write(
+                        'S'.code
+                    )
+
+                    outputStream.flush()
+
+                    /*
+                     * ESP:
+                     *
+                     * client.write(0);
+                     * client.write(unlocked);
+                     *
+                     * TOTAL = 2 bytes
+                     */
+                    val response =
+                        readExact(
+                            inputStream,
+                            STATUS_RESPONSE_SIZE,
+                            5000
+                        )
+
+                    if (
+                        response == null ||
+                        response.size !=
+                        STATUS_RESPONSE_SIZE
+                    ) {
+
+                        Log.e(
+                            TAG,
+                            "Invalid status response"
+                        )
+
+                        handler.post {
+
+                            result.error(
+                                "ESP_STATUS",
+                                "Invalid status response. Expected 2 bytes.",
+                                null
+                            )
+                        }
+
+                        return@synchronized
+                    }
+
+                    val status =
+                        response[0]
+                            .toInt()
+                            .and(0xFF)
+
+                    val state =
+                        response[1]
+                            .toInt()
+                            .and(0xFF)
+
+                    Log.d(
+                        TAG,
+                        "S response: status=$status state=$state"
+                    )
+
+                    if (
+                        status != 0
+                    ) {
+
+                        handler.post {
+
+                            result.error(
+                                "ESP_STATUS_DEVICE",
+                                "ESP returned status=$status",
+                                status
+                            )
+                        }
+
                         return@synchronized
                     }
 
                     handler.post {
-                        result.success(tokenList)
+
+                        result.success(
+                            state
+                        )
                     }
 
-                } catch (e: Exception) {
-                    Log.e(TAG, "❌ U error", e)
+                } catch (
+                    e: SocketTimeoutException
+                ) {
+
+                    Log.e(
+                        TAG,
+                        "Status response timeout",
+                        e
+                    )
+
                     closeSocket()
+
                     handler.post {
-                        result.error("ESP_U_ERROR", e.message ?: "U failed", null)
+
+                        result.error(
+                            "ESP_STATUS_TIMEOUT",
+                            "ESP did not return status.",
+                            null
+                        )
                     }
+
+                } catch (
+                    e: Exception
+                ) {
+
+                    Log.e(
+                        TAG,
+                        "Status command error",
+                        e
+                    )
+
+                    closeSocket()
+
+                    handler.post {
+
+                        result.error(
+                            "ESP_STATUS_ERROR",
+                            e.message
+                                ?: "Unknown status error.",
+                            null
+                        )
+                    }
+                }
+            }
+
+        }.start()
+    }
+
+    private fun getPresenceStatus(
+        result: MethodChannel.Result
+    ) {
+
+        Thread {
+
+            synchronized(commandLock) {
+
+                try {
+                    if (!isSocketAlive() && !reconnectTcp()) {
+                        handler.post { result.error("ESP_CONNECTION", "ESP not connected.", null) }
+                        return@synchronized
+                    }
+                    val inputStream = input
+                    val outputStream = output
+                    if (inputStream == null || outputStream == null) {
+                        handler.post { result.error("ESP_STREAM", "ESP stream unavailable.", null) }
+                        return@synchronized
+                    }
+                    clearInput(inputStream)
+                    outputStream.write('P'.code)
+                    outputStream.flush()
+                    val response = readExact(inputStream, PRESENCE_RESPONSE_SIZE, 5000)
+                    if (response == null || response.size != PRESENCE_RESPONSE_SIZE) {
+                        closeSocket()
+                        handler.post { result.error("ESP_PRESENCE", "Invalid presence response. Expected 3 bytes.", null) }
+                        return@synchronized
+                    }
+                    val status = response[0].toInt().and(0xFF)
+                    if (status != 0) {
+                        handler.post { result.error("ESP_PRESENCE_DEVICE", "ESP returned status=$status", status) }
+                        return@synchronized
+                    }
+                    val lockState = response[1].toInt().and(0xFF)
+                    val present = response[2].toInt().and(0xFF)
+                    handler.post { result.success(listOf(lockState, present)) }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Presence command error", e)
+                    closeSocket()
+                    handler.post { result.error("ESP_PRESENCE_ERROR", e.message ?: "Unknown presence error.", null) }
                 }
             }
         }.start()
     }
 
     // ============================================================
-    // ✅ SEND T — FIXED: same reconnect-on-failure pattern
+    // RECONNECT TCP
     // ============================================================
 
-    private fun sendT(call: MethodCall, result: MethodChannel.Result) {
-        Thread {
-            synchronized(commandLock) {
-                try {
-                    Log.d(TAG, "================================")
-                    Log.d(TAG, "📤 SEND T")
-                    Log.d(TAG, "================================")
+    private fun reconnectTcp():
+            Boolean {
 
-                    val tokenList = call.argument<List<Int>>("token")
-                    if (tokenList == null || tokenList.size != TOKEN_SIZE) {
-                        handler.post {
-                            result.error("INVALID_TOKEN", "Token must contain exactly 40 bytes", null)
-                        }
-                        return@synchronized
-                    }
+        synchronized(
+            socketLock
+        ) {
 
-                    val token = ByteArray(TOKEN_SIZE)
-                    for (i in 0 until TOKEN_SIZE) {
-                        token[i] = tokenList[i].toByte()
-                    }
+            if (
+                isSocketAlive()
+            ) {
 
-                    var response: ByteArray? = null
-                    var attempts = 0
-                    val maxAttempts = 4 // ✅ one extra attempt
-
-                    while (attempts < maxAttempts && response == null) {
-                        attempts++
-                        Log.d(TAG, "🔄 T attempt $attempts/$maxAttempts")
-
-                        // ✅ FIX: same as sendU — always verify + rebuild the connection
-                        // rather than trusting a socket that "looks" alive locally.
-                        if (!isSocketAlive()) {
-                            Log.d(TAG, "🔌 Socket not alive, reconnecting...")
-                            closeSocket()
-                            Thread.sleep(100)
-                            if (!reconnectTcp()) {
-                                Log.e(TAG, "❌ Failed to reconnect")
-                                Thread.sleep(200)
-                                continue
-                            }
-                        } else {
-                            Log.d(TAG, "✅ Using existing connection for T")
-                        }
-
-                        val socketInput = input
-                        val socketOutput = output
-
-                        if (socketInput == null || socketOutput == null) {
-                            closeSocket()
-                            Thread.sleep(200)
-                            continue
-                        }
-
-                        try {
-                            while (socketInput.available() > 0) {
-                                socketInput.read()
-                            }
-                            Log.d(TAG, "🧹 Buffer cleared")
-                        } catch (_: Exception) {}
-
-                        try {
-                            // ✅ FIX: send 'T' + the 40-byte token as ONE write, not two.
-                            // The ESP's handleTrigger() does a single non-blocking
-                            // client->read(req, 40) with no retry loop — if the token
-                            // arrives in a separate TCP segment after 'T' (as the old
-                            // write+sleep(50)+write did), the ESP reads fewer than 40
-                            // bytes and returns "Invalid data length" (status 1, 21
-                            // bytes) — exactly what showed up in the logs. Combining
-                            // into one write (with tcpNoDelay already set) sends both
-                            // in a single packet so the ESP gets all 41 bytes together.
-                            val payload = ByteArray(1 + TOKEN_SIZE)
-                            payload[0] = 'T'.code.toByte()
-                            System.arraycopy(token, 0, payload, 1, TOKEN_SIZE)
-
-                            Log.d(TAG, "📤 Writing 'T' + 40-byte token as one packet")
-                            socketOutput.write(payload)
-                            socketOutput.flush()
-                            Log.d(TAG, "✅ T + 40 bytes sent")
-
-                            response = readExactFast(socketInput, T_RESPONSE_SIZE, 3000)
-
-                            if (response == null) {
-                                Log.e(TAG, "❌ No T response — ESP likely dropped the connection")
-                            }
-                        } catch (e: Exception) {
-                            Log.e(TAG, "❌ Write/Read error: ${e.message}")
-                            response = null
-                        }
-
-                        // ✅ THE ACTUAL FIX: force-close on failure so the next attempt
-                        // reconnects for real instead of reusing a dead socket.
-                        if (response == null) {
-                            closeSocket()
-                            if (attempts < maxAttempts) {
-                                Thread.sleep(200)
-                            }
-                        }
-                    }
-
-                    if (response == null) {
-                        Log.e(TAG, "❌ No T response from ESP after $maxAttempts attempts")
-                        closeSocket()
-                        handler.post {
-                            result.error("ESP_T_RESPONSE_ERROR", "ESP did not return T response", null)
-                        }
-                        return@synchronized
-                    }
-
-                    Log.d(TAG, "✅ T response received: ${response.size} bytes")
-
-                    val status = if (response.size >= 1) {
-                        response[0].toInt() and 0xFF
-                    } else {
-                        -1
-                    }
-                    Log.d(TAG, "📥 T status: $status")
-
-                    if (status == 0) {
-                        Log.d(TAG, "================================")
-                        Log.d(TAG, "✅ T COMMAND SUCCESS")
-                        Log.d(TAG, "================================")
-                        handler.post { result.success(true) }
-                    } else if (status == -1) {
-                        Log.d(TAG, "⚠️ No status byte, assuming success")
-                        handler.post { result.success(true) }
-                    } else {
-                        Log.e(TAG, "❌ ESP returned error status: $status")
-                        handler.post { result.success(false) }
-                    }
-
-                } catch (e: Exception) {
-                    Log.e(TAG, "❌ T error", e)
-                    closeSocket()
-                    handler.post {
-                        result.error("ESP_T_ERROR", e.message ?: "T command failed", null)
-                    }
-                }
+                return true
             }
-        }.start()
+
+            closeSocket()
+
+            return try {
+
+                val socket =
+                    Socket()
+
+                /*
+                 * Android 10+:
+                 *
+                 * Always bind the TCP socket to the ESP
+                 * WiFi network.
+                 */
+                if (
+                    Build.VERSION.SDK_INT >=
+                    Build.VERSION_CODES.Q
+                ) {
+
+                    val network =
+                        boundNetwork
+
+                    if (
+                        network == null
+                    ) {
+
+                        Log.e(
+                            TAG,
+                            "No bound ESP network available"
+                        )
+
+                        return false
+                    }
+
+                    network.bindSocket(
+                        socket
+                    )
+                }
+
+                socket.connect(
+                    InetSocketAddress(espIp, espPort),
+                    10000
+                )
+
+                socket.soTimeout =
+                    10000
+
+                socket.keepAlive =
+                    true
+
+                socket.tcpNoDelay =
+                    true
+
+                currentSocket =
+                    socket
+
+                input =
+                    socket.getInputStream()
+
+                output =
+                    socket.getOutputStream()
+
+                Log.d(
+                    TAG,
+                    "TCP reconnect successful"
+                )
+
+                true
+
+            } catch (
+                e: Exception
+            ) {
+
+                Log.e(
+                    TAG,
+                    "TCP reconnect failed",
+                    e
+                )
+
+                closeSocket()
+
+                false
+            }
+        }
     }
 
     // ============================================================
-    // GET STATUS — same fix applied
+    // READ EXACT
     // ============================================================
 
-    private fun getStatus(result: MethodChannel.Result) {
-        Thread {
-            synchronized(commandLock) {
-                try {
-                    var response: ByteArray? = null
-                    var attempts = 0
-                    val maxAttempts = 3
+    private fun readExact(
+        stream: InputStream,
+        size: Int,
+        timeoutMs: Long
+    ): ByteArray? {
 
-                    while (attempts < maxAttempts && response == null) {
-                        attempts++
+        if (
+            size <= 0
+        ) {
 
-                        if (!isSocketAlive()) {
-                            closeSocket()
-                            if (!reconnectTcp()) {
-                                Thread.sleep(200)
-                                continue
-                            }
-                        }
+            return null
+        }
 
-                        val socketInput = input
-                        val socketOutput = output
+        val buffer =
+            ByteArray(
+                size
+            )
 
-                        if (socketInput == null || socketOutput == null) {
-                            closeSocket()
-                            continue
-                        }
+        var total =
+            0
 
-                        try {
-                            while (socketInput.available() > 0) {
-                                socketInput.read()
-                            }
-                        } catch (_: Exception) {}
+        val start =
+            System.currentTimeMillis()
 
-                        try {
-                            socketOutput.write('S'.code)
-                            socketOutput.flush()
-                            response = readExactFast(socketInput, STATUS_RESPONSE_SIZE, 3000)
-                        } catch (e: Exception) {
-                            Log.e(TAG, "❌ Status write/read error: ${e.message}")
-                            response = null
-                        }
+        while (
+            total < size
+        ) {
 
-                        // ✅ FIX: close on failure so next attempt reconnects for real
-                        if (response == null || response.size < 2) {
-                            closeSocket()
-                            response = null
-                            if (attempts < maxAttempts) Thread.sleep(200)
-                        }
-                    }
+            /*
+             * Our own timeout.
+             */
+            if (
+                System.currentTimeMillis() -
+                start >=
+                timeoutMs
+            ) {
 
-                    if (response == null || response.size < 2) {
-                        closeSocket()
-                        handler.post {
-                            result.error("ESP_STATUS_ERROR", "Status response failed", null)
-                        }
-                        return@synchronized
-                    }
+                Log.e(
+                    TAG,
+                    "readExact timeout: $total/$size"
+                )
 
-                    val state = response[1].toInt().and(0xFF)
-                    Log.d(TAG, "📥 ESP state: ${if (state == 1) "UNLOCKED" else "LOCKED"} ($state)")
-                    handler.post { result.success(state) }
-
-                } catch (e: Exception) {
-                    closeSocket()
-                    handler.post {
-                        result.error("ESP_STATUS_ERROR", e.message ?: "Status failed", null)
-                    }
-                }
-            }
-        }.start()
-    }
-
-    // ============================================================
-    // UTILITY METHODS
-    // ============================================================
-
-    private fun readExactFast(input: InputStream, size: Int, timeoutMs: Long): ByteArray? {
-        val buffer = ByteArray(size)
-        var total = 0
-        val start = System.currentTimeMillis()
-
-        while (total < size) {
-            if (System.currentTimeMillis() - start >= timeoutMs) {
-                Log.e(TAG, "⏰ Fast read timeout: $total/$size")
-                return if (total > 0) buffer.copyOf(total) else null
+                return null
             }
 
             try {
-                val count = input.read(buffer, total, size - total)
 
-                if (count < 0) {
-                    Log.d(TAG, "📥 EOF reached, read $total/$size bytes")
-                    return if (total > 0) buffer.copyOf(total) else null
+                /*
+                 * InputStream.read() may return fewer bytes
+                 * than requested.
+                 *
+                 * Therefore continue until the exact
+                 * number of bytes is received.
+                 */
+                val count =
+                    stream.read(
+                        buffer,
+                        total,
+                        size - total
+                    )
+
+                if (
+                    count < 0
+                ) {
+
+                    Log.e(
+                        TAG,
+                        "Socket closed while reading: $total/$size"
+                    )
+
+                    return null
                 }
 
-                if (count > 0) {
+                if (
+                    count > 0
+                ) {
+
                     total += count
-                    Log.d(TAG, "📥 Read $total/$size bytes")
-                } else {
-                    Thread.sleep(5)
+
+                    Log.d(
+                        TAG,
+                        "Received $total/$size bytes"
+                    )
                 }
 
-            } catch (e: Exception) {
-                if (total > 0) {
-                    Log.d(TAG, "📥 Connection aborted, read $total/$size bytes")
-                    return buffer.copyOf(total)
-                }
-                Log.e(TAG, "❌ Read error: ${e.message}")
+            } catch (
+                e: SocketTimeoutException
+            ) {
+
+                Log.e(
+                    TAG,
+                    "Socket read timeout: $total/$size"
+                )
+
+                return null
+
+            } catch (
+                e: Exception
+            ) {
+
+                Log.e(
+                    TAG,
+                    "readExact error",
+                    e
+                )
+
                 return null
             }
         }
@@ -767,98 +1936,184 @@ class MainActivity : FlutterActivity() {
         return buffer
     }
 
-    private fun unregisterNetworkCallback() {
+    // ============================================================
+    // CLEAR STALE INPUT
+    // ============================================================
+
+    private fun clearInput(
+        stream: InputStream
+    ) {
+
         try {
-            networkCallback?.let {
-                connectivityManager?.unregisterNetworkCallback(it)
-            }
-        } catch (_: Exception) {}
-        networkCallback = null
-    }
 
-    private fun isSocketAlive(): Boolean {
-        synchronized(socketLock) {
-            val socket = currentSocket ?: return false
-            return socket.isConnected && !socket.isClosed &&
-                    !socket.isInputShutdown && !socket.isOutputShutdown
-        }
-    }
+            var cleared =
+                0
 
-    // ✅ FIX: reconnect on the ESP's own WiFi network when we have it (Android 10+),
-    // instead of a plain Socket() which won't route to the ESP AP correctly if the
-    // phone also has a normal internet-connected WiFi/cellular network active.
-    private fun reconnectTcp(): Boolean {
-        synchronized(commandLock) {
-            if (isSocketAlive()) {
-                return true
-            }
+            while (
+                stream.available() > 0
+            ) {
 
-            closeSocket()
+                val value =
+                    stream.read()
 
-            return try {
-                Log.d(TAG, "🔄 Reconnecting TCP socket...")
-                val socket = Socket()
-
-                val network = boundNetwork
-                if (network != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    network.bindSocket(socket)
+                if (
+                    value < 0
+                ) {
+                    break
                 }
 
-                socket.connect(InetSocketAddress(ESP_IP, ESP_PORT), 5000)
-                socket.soTimeout = 5000
-                socket.keepAlive = true
-                socket.tcpNoDelay = true
-                socket.setSoLinger(true, 0)
-
-                currentSocket = socket
-                input = socket.getInputStream()
-                output = socket.getOutputStream()
-
-                Log.d(TAG, "✅ TCP reconnected")
-                true
-            } catch (e: Exception) {
-                Log.e(TAG, "❌ TCP reconnect failed: ${e.message}")
-                closeSocket()
-                false
+                cleared++
             }
+
+            if (
+                cleared > 0
+            ) {
+
+                Log.w(
+                    TAG,
+                    "Cleared $cleared stale bytes"
+                )
+            }
+
+        } catch (
+            _: Exception
+        ) {
         }
     }
 
-    private fun getConnectionStatus(result: MethodChannel.Result) {
-        result.success(isSocketAlive())
+    // ============================================================
+    // SOCKET STATUS
+    // ============================================================
+
+    private fun isSocketAlive():
+            Boolean {
+
+        synchronized(
+            socketLock
+        ) {
+
+            val socket =
+                currentSocket
+                    ?: return false
+
+            return socket.isConnected &&
+                    !socket.isClosed &&
+                    !socket.isInputShutdown &&
+                    !socket.isOutputShutdown
+        }
     }
 
-    private fun disconnectFromEsp(result: MethodChannel.Result) {
+    // ============================================================
+    // DISCONNECT
+    // ============================================================
+
+    private fun disconnect(
+        result: MethodChannel.Result
+    ) {
+
         try {
-            Log.d(TAG, "🔌 Disconnecting ESP")
+
             unregisterNetworkCallback()
+
             closeSocket()
-            boundNetwork = null
-            result.success(true)
-        } catch (e: Exception) {
-            result.error("ESP_DISCONNECT_ERROR", e.message, null)
+
+            boundNetwork =
+                null
+
+            result.success(
+                true
+            )
+
+        } catch (
+            e: Exception
+        ) {
+
+            result.error(
+                "DISCONNECT_ERROR",
+                e.message
+                    ?: "Disconnect failed.",
+                null
+            )
         }
     }
+
+    // ============================================================
+    // NETWORK CALLBACK
+    // ============================================================
+
+    private fun unregisterNetworkCallback() {
+
+        try {
+
+            networkCallback?.let {
+
+                connectivityManager
+                    ?.unregisterNetworkCallback(
+                        it
+                    )
+            }
+
+        } catch (
+            _: Exception
+        ) {
+        }
+
+        networkCallback =
+            null
+    }
+
+    // ============================================================
+    // CLOSE SOCKET
+    // ============================================================
 
     private fun closeSocket() {
-        synchronized(socketLock) {
-            try { input?.close() } catch (_: Exception) {}
-            try { output?.close() } catch (_: Exception) {}
-            try { currentSocket?.close() } catch (_: Exception) {}
-            input = null
-            output = null
-            currentSocket = null
+
+        synchronized(
+            socketLock
+        ) {
+
+            try {
+                input?.close()
+            } catch (
+                _: Exception
+            ) {
+            }
+
+            try {
+                output?.close()
+            } catch (
+                _: Exception
+            ) {
+            }
+
+            try {
+                currentSocket?.close()
+            } catch (
+                _: Exception
+            ) {
+            }
+
+            input =
+                null
+
+            output =
+                null
+
+            currentSocket =
+                null
         }
     }
 
-    override fun onDestroy() {
-        Log.d(TAG, "🧹 MainActivity destroy")
-        unregisterNetworkCallback()
-        closeSocket()
-        super.onDestroy()
-    }
+    // ============================================================
+    // ACTIVITY DESTROY
+    // ============================================================
 
-    companion object {
-        private val handler = android.os.Handler(android.os.Looper.getMainLooper())
+    override fun onDestroy() {
+
+        unregisterNetworkCallback()
+
+        closeSocket()
+
+        super.onDestroy()
     }
 }

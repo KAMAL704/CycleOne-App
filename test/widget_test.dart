@@ -1,30 +1,26 @@
-// This is a basic Flutter widget test.
-//
-// To perform an interaction with a widget in your test, use the WidgetTester
-// utility in the flutter_test package. For example, you can send tap and scroll
-// gestures. You can also use WidgetTester to find child widgets in the widget
-// tree, read text, and verify that the values of widget properties are correct.
-
-import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:cycleone/main.dart';
+import 'package:cycle_one/models/qr_payload.dart';
+import 'package:cycle_one/services/pending_operation_store.dart';
 
 void main() {
-  testWidgets('Counter increments smoke test', (WidgetTester tester) async {
-    // Build our app and trigger a frame.
-    await tester.pumpWidget(const MyApp());
+  test('accepts only canonical CycleOne QR payloads', () {
+    const id = '11111111-1111-4111-8111-111111111111';
+    final payload = QrPayload.parse('cycleone://cycle/$id', expectedKind: QrKind.cycle);
+    expect(payload.kind, QrKind.cycle);
+    expect(payload.id, id);
+  });
 
-    // Verify that our counter starts at 0.
-    expect(find.text('0'), findsOneWidget);
-    expect(find.text('1'), findsNothing);
+  test('rejects a QR for the wrong resource type', () {
+    expect(
+      () => QrPayload.parse('cycleone://stand/11111111-1111-4111-8111-111111111111', expectedKind: QrKind.cycle),
+      throwsA(isA<Exception>()),
+    );
+  });
 
-    // Tap the '+' icon and trigger a frame.
-    await tester.tap(find.byIcon(Icons.add));
-    await tester.pump();
-
-    // Verify that our counter has incremented.
-    expect(find.text('0'), findsNothing);
-    expect(find.text('1'), findsOneWidget);
+  test('recovery markers are scoped to the authenticated user', () {
+    const operation = PendingOperation(type: PendingOperationType.start, cycleId: 'cycle', standId: 'stand', userId: 'user-a');
+    expect(operation.matches(PendingOperationType.start, 'cycle', 'stand', 'user-a'), isTrue);
+    expect(operation.matches(PendingOperationType.start, 'cycle', 'stand', 'user-b'), isFalse);
   });
 }

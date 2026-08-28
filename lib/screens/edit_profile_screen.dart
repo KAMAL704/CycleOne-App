@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+
+import '../core/errors/app_exception.dart';
 import '../providers/auth_provider.dart';
 
 class EditProfileScreen extends StatefulWidget {
@@ -10,98 +12,49 @@ class EditProfileScreen extends StatefulWidget {
 }
 
 class _EditProfileScreenState extends State<EditProfileScreen> {
-  final _branchController = TextEditingController();
-  final _yearController = TextEditingController();
-  final _mobileController = TextEditingController();
-  bool _isLoading = false;
+  late final TextEditingController _name;
+  late final TextEditingController _phone;
+  late final TextEditingController _registration;
+  bool _loading = false;
 
   @override
   void initState() {
     super.initState();
     final profile = context.read<AuthProvider>().profile;
-    _branchController.text = profile['branch'] ?? '';
-    _yearController.text = profile['year'] ?? '';
-    _mobileController.text = profile['mobile'] ?? '';
+    _name = TextEditingController(text: profile['name']?.toString() ?? '');
+    _phone = TextEditingController(text: profile['phone']?.toString() ?? '');
+    _registration = TextEditingController(text: profile['registration_id']?.toString() ?? '');
   }
 
-  Future<void> _saveChanges() async {
-    setState(() => _isLoading = true);
+  @override
+  void dispose() {
+    _name.dispose();
+    _phone.dispose();
+    _registration.dispose();
+    super.dispose();
+  }
+
+  Future<void> _save() async {
+    setState(() => _loading = true);
     try {
-      await context.read<AuthProvider>().updateProfile(
-        branch: _branchController.text.trim(),
-        year: _yearController.text.trim(),
-        mobile: _mobileController.text.trim(),
-      );
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Profile updated successfully!')),
-        );
-        Navigator.pop(context);
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error: $e')),
-        );
-      }
+      await context.read<AuthProvider>().updateProfile(name: _name.text, phone: _phone.text, registrationId: _registration.text);
+      if (mounted) Navigator.pop(context);
+    } on AppException catch (error) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(error.message)));
     } finally {
-      if (mounted) setState(() => _isLoading = false);
+      if (mounted) setState(() => _loading = false);
     }
   }
 
   @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Edit Profile'),
-        backgroundColor: Colors.green.shade700,
-        actions: [
-          if (_isLoading)
-            const Padding(
-              padding: EdgeInsets.all(16),
-              child: CircularProgressIndicator(strokeWidth: 2),
-            )
-          else
-            TextButton(
-              onPressed: _saveChanges,
-              child: const Text('Save', style: TextStyle(fontSize: 16, color: Colors.white)),
-            ),
-        ],
-      ),
-      body: Padding(
-        padding: const EdgeInsets.all(20),
-        child: Column(
-          children: [
-            TextField(
-              controller: _branchController,
-              decoration: const InputDecoration(
-                labelText: 'Branch/RegNo.',
-                border: OutlineInputBorder(),
-                prefixIcon: Icon(Icons.school),
-              ),
-            ),
-            const SizedBox(height: 16),
-            TextField(
-              controller: _yearController,
-              decoration: const InputDecoration(
-                labelText: 'Year (e.g., 3rd Year)',
-                border: OutlineInputBorder(),
-                prefixIcon: Icon(Icons.date_range),
-              ),
-            ),
-            const SizedBox(height: 16),
-            TextField(
-              controller: _mobileController,
-              decoration: const InputDecoration(
-                labelText: 'Mobile Number',
-                border: OutlineInputBorder(),
-                prefixIcon: Icon(Icons.phone),
-              ),
-              keyboardType: TextInputType.phone,
-            ),
-          ],
-        ),
-      ),
-    );
-  }
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(title: const Text('Edit profile')),
+        body: ListView(padding: const EdgeInsets.all(20), children: [
+          TextField(controller: _name, decoration: const InputDecoration(labelText: 'Name')),
+          TextField(controller: _phone, keyboardType: TextInputType.phone, decoration: const InputDecoration(labelText: 'Phone')),
+          TextField(controller: _registration, decoration: const InputDecoration(labelText: 'Registration ID')),
+          const SizedBox(height: 24),
+          FilledButton(onPressed: _loading ? null : _save, child: _loading ? const CircularProgressIndicator() : const Text('Save changes')),
+        ]),
+      );
 }

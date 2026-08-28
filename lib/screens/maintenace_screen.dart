@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
+import '../services/settings_service.dart';
 
 class MaintenanceScreen extends StatefulWidget {
   const MaintenanceScreen({super.key});
@@ -14,13 +15,16 @@ class _MaintenanceScreenState extends State<MaintenanceScreen> {
 
   Future<void> _checkAgain() async {
     setState(() => _isChecking = true);
-    // Simulate network call to check maintenance status
-    await Future.delayed(const Duration(seconds: 2));
-    // For demo, we always return to splash (you would check a real flag)
+    final maintenance = await SettingsService.isMaintenanceMode();
     if (mounted) {
       setState(() => _isChecking = false);
-      // Navigate back to splash – if maintenance is over, the app will proceed.
-      Navigator.pushReplacementNamed(context, '/');
+      if (maintenance) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('CycleOne is still under maintenance.')),
+        );
+      } else {
+        Navigator.pushReplacementNamed(context, '/home');
+      }
     }
   }
 
@@ -42,7 +46,6 @@ class _MaintenanceScreenState extends State<MaintenanceScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: Colors.white,
       body: Center(
         child: Padding(
           padding: const EdgeInsets.all(32.0),
@@ -68,16 +71,16 @@ class _MaintenanceScreenState extends State<MaintenanceScreen> {
               const SizedBox(height: 16),
               const Text(
                 "We're improving the CycleOne app.\nPlease try again after some time.",
-                style: TextStyle(
-                  fontSize: 16,
-                  color: Colors.grey,
-                ),
+                style: TextStyle(fontSize: 16, color: Colors.grey),
                 textAlign: TextAlign.center,
               ),
               const SizedBox(height: 12),
               // Estimated completion time (optional)
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 20,
+                  vertical: 8,
+                ),
                 decoration: BoxDecoration(
                   color: Colors.green.shade50,
                   borderRadius: BorderRadius.circular(30),
@@ -92,15 +95,15 @@ class _MaintenanceScreenState extends State<MaintenanceScreen> {
               _isChecking
                   ? const CircularProgressIndicator()
                   : ElevatedButton.icon(
-                onPressed: _checkAgain,
-                icon: const Icon(Icons.refresh),
-                label: const Text('Check Again'),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.green,
-                  foregroundColor: Colors.white,
-                  minimumSize: const Size(200, 50),
-                ),
-              ),
+                      onPressed: _checkAgain,
+                      icon: const Icon(Icons.refresh),
+                      label: const Text('Check Again'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.green,
+                        foregroundColor: Colors.white,
+                        minimumSize: const Size(200, 50),
+                      ),
+                    ),
               const SizedBox(height: 16),
               // Contact support
               TextButton.icon(

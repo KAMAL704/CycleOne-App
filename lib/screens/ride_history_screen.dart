@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
-import 'package:supabase_flutter/supabase_flutter.dart';
+
+import '../core/errors/app_exception.dart';
 import '../services/cycle_service.dart';
 
 class RideHistoryScreen extends StatefulWidget {
@@ -10,308 +11,107 @@ class RideHistoryScreen extends StatefulWidget {
 }
 
 class _RideHistoryScreenState extends State<RideHistoryScreen> {
-  List<Map<String, dynamic>> _rides = [];
-  bool _isLoading = true;
-  String _errorMessage = '';
+  final _service = CycleService();
+  List<Map<String, dynamic>> _rides = const [];
+  bool _loading = true;
+  String? _error;
 
   @override
   void initState() {
     super.initState();
-    _loadRideHistory();
+    _load();
   }
 
-  Future<void> _loadRideHistory() async {
-    setState(() {
-      _isLoading = true;
-      _errorMessage = '';
-    });
+  Future<void> _load() async {
+    if (mounted) setState(() { _loading = true; _error = null; });
     try {
-      final rides = await CycleService.getRideHistory();
-      setState(() {
-        _rides = rides;
-        _isLoading = false;
-      });
-    } catch (e) {
-      setState(() {
-        _errorMessage = 'Error loading ride history: $e';
-        _isLoading = false;
-      });
+      final rides = await _service.getRideHistory();
+      if (mounted) setState(() => _rides = rides);
+    } on AppException catch (error) {
+      if (mounted) setState(() => _error = error.message);
+    } finally {
+      if (mounted) setState(() => _loading = false);
     }
   }
 
-  String _formatTime(String? isoString) {
-    if (isoString == null || isoString.isEmpty) return 'N/A';
-    try {
-      final dt = DateTime.parse(isoString).toLocal();
-      return '${dt.day.toString().padLeft(2, '0')}/${dt.month.toString().padLeft(2, '0')}/${dt.year} ${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
-    } catch (e) {
-      return isoString;
-    }
+  String _date(Object? value) {
+    final text = value?.toString();
+    if (text == null || text.isEmpty) return '—';
+    final parsed = DateTime.tryParse(text);
+    if (parsed == null) return text;
+    final local = parsed.toLocal();
+    return '${local.day.toString().padLeft(2, '0')}/${local.month.toString().padLeft(2, '0')}/${local.year} '
+        '${local.hour.toString().padLeft(2, '0')}:${local.minute.toString().padLeft(2, '0')}';
   }
 
-  String _formatDuration(int seconds) {
-    final hours = seconds ~/ 3600;
-    final minutes = (seconds % 3600) ~/ 60;
-    final secs = seconds % 60;
-    if (hours > 0) {
-      return '${hours}h ${minutes}m ${secs}s';
-    } else if (minutes > 0) {
-      return '${minutes}m ${secs}s';
-    } else {
-      return '${secs}s';
-    }
+  String _duration(Map<String, dynamic> ride) {
+    final started = DateTime.tryParse(ride['started_at']?.toString() ?? '');
+    final ended = DateTime.tryParse(ride['ended_at']?.toString() ?? '');
+    if (started == null || ended == null) return '—';
+    final minutes = ended.difference(started).inMinutes;
+    return minutes < 60 ? '$minutes min' : '${minutes ~/ 60}h ${minutes % 60}m';
   }
+
+  Map<String, dynamic>? _map(Object? value) => value is Map ? Map<String, dynamic>.from(value) : null;
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Ride History'),
-        backgroundColor: Colors.green.shade700,
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.refresh),
-            onPressed: _loadRideHistory,
-          ),
-        ],
-      ),
-      body: _isLoading
+      appBar: AppBar(title: const Text('Ride history'), actions: [IconButton(onPressed: _loading ? null : _load, icon: const Icon(Icons.refresh))]),
+      body: _loading
           ? const Center(child: CircularProgressIndicator())
-          : _errorMessage.isNotEmpty
-          ? Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            const Icon(Icons.error_outline, size: 60, color: Colors.red),
-            const SizedBox(height: 16),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 24),
-              child: Text(
-                _errorMessage,
-                textAlign: TextAlign.center,
-                style: const TextStyle(fontSize: 16),
-              ),
-            ),
-            const SizedBox(height: 16),
-            ElevatedButton(
-              onPressed: _loadRideHistory,
-              child: const Text('Retry'),
-            ),
-          ],
-        ),
-      )
-          : _rides.isEmpty
-          ? const Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(Icons.history, size: 60, color: Colors.grey),
-            SizedBox(height: 16),
-            Text(
-              'No rides yet.',
-              style: TextStyle(fontSize: 16, color: Colors.grey),
-            ),
-            SizedBox(height: 8),
-            Text(
-              'Start your first ride!',
-              style: TextStyle(fontSize: 14, color: Colors.grey),
-            ),
-          ],
-        ),
-      )
-          : ListView.builder(
-        padding: const EdgeInsets.all(12),
-        itemCount: _rides.length,
-        itemBuilder: (context, index) {
-          final ride = _rides[index];
-          final cycleId = ride['cycle_id'] ?? 'N/A';
-          final startStand = ride['start_stand']?['name'] ?? 'Unknown';
-          final returnStand = ride['return_stand']?['name'] ?? 'In Progress';
-          final startTime = ride['start_time'] ?? '';
-          final endTime = ride['end_time']; // ✅ Get end time
-          final duration = ride['duration'] ?? 0;
-          final status = ride['status'] ?? 'active';
-
-          final isActive = status == 'active';
-
-          return Card(
-            elevation: 2,
-            margin: const EdgeInsets.only(bottom: 12),
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(12),
-            ),
-            child: Padding(
-              padding: const EdgeInsets.all(12),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  // Left: CircleAvatar
-                  CircleAvatar(
-                    backgroundColor: isActive ? Colors.orange : Colors.green,
-                    child: Icon(
-                      isActive ? Icons.timelapse : Icons.check_circle,
-                      color: Colors.white,
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  // Middle: Content (expanded)
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          'Cycle: $cycleId',
-                          style: const TextStyle(
-                            fontWeight: FontWeight.bold,
-                            fontSize: 15,
-                          ),
-                        ),
-                        const SizedBox(height: 4),
-                        // Start stand
-                        Row(
-                          children: [
-                            const Icon(Icons.play_arrow, size: 14, color: Colors.green),
-                            const SizedBox(width: 4),
-                            Expanded(
-                              child: Text(
-                                startStand,
-                                style: const TextStyle(fontSize: 14),
-                                overflow: TextOverflow.ellipsis,
+          : _error != null
+              ? _ErrorState(message: _error!, onRetry: _load)
+              : _rides.isEmpty
+                  ? const Center(child: Text('No rides yet. Start a ride to see it here.'))
+                  : RefreshIndicator(
+                      onRefresh: _load,
+                      child: ListView.separated(
+                        padding: const EdgeInsets.all(16),
+                        itemCount: _rides.length,
+                        separatorBuilder: (_, __) => const SizedBox(height: 10),
+                        itemBuilder: (context, index) {
+                          final ride = _rides[index];
+                          final cycle = _map(ride['cycles']);
+                          final start = _map(ride['start_stand']);
+                          final end = _map(ride['end_stand']);
+                          final active = ride['status'] == 'active';
+                          return Card(
+                            child: ListTile(
+                              leading: CircleAvatar(
+                                backgroundColor: active ? Colors.orange.shade100 : Colors.green.shade100,
+                                child: Icon(active ? Icons.timelapse : Icons.check, color: active ? Colors.orange : Colors.green),
                               ),
+                              title: Text('Cycle ${cycle?['cycle_number'] ?? ride['cycle_id'] ?? '—'}'),
+                              subtitle: Text('${start?['name'] ?? 'Unknown stand'} → ${end?['name'] ?? (active ? 'In progress' : '—')}\n'
+                                  'Started ${_date(ride['started_at'])}${active ? '' : ' · ${_duration(ride)}'}'),
+                              isThreeLine: true,
+                              trailing: Chip(label: Text(active ? 'Active' : (ride['status']?.toString() ?? 'Completed'))),
                             ),
-                          ],
-                        ),
-                        if (!isActive) ...[
-                          const SizedBox(height: 2),
-                          Row(
-                            children: [
-                              const Icon(Icons.stop, size: 14, color: Colors.red),
-                              const SizedBox(width: 4),
-                              Expanded(
-                                child: Text(
-                                  returnStand,
-                                  style: const TextStyle(fontSize: 14),
-                                  overflow: TextOverflow.ellipsis,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ],
-                        const SizedBox(height: 4),
-                        // ✅ Start Time
-                        Row(
-                          children: [
-                            const Icon(Icons.access_time, size: 14, color: Colors.grey),
-                            const SizedBox(width: 4),
-                            Text(
-                              'Start: ${_formatTime(startTime)}',
-                              style: const TextStyle(fontSize: 12, color: Colors.grey),
-                            ),
-                          ],
-                        ),
-                        // ✅ End Time (only for completed rides)
-                        if (!isActive && endTime != null) ...[
-                          Row(
-                            children: [
-                              const Icon(Icons.access_time, size: 14, color: Colors.grey),
-                              const SizedBox(width: 4),
-                              Text(
-                                'End: ${_formatTime(endTime)}',
-                                style: const TextStyle(fontSize: 12, color: Colors.grey),
-                              ),
-                            ],
-                          ),
-                        ],
-                        // Duration
-                        if (!isActive) ...[
-                          Row(
-                            children: [
-                              const Icon(Icons.timer, size: 14, color: Colors.grey),
-                              const SizedBox(width: 4),
-                              Text(
-                                'Duration: ${_formatDuration(duration)}',
-                                style: const TextStyle(fontSize: 12, color: Colors.grey),
-                              ),
-                            ],
-                          ),
-                        ],
-                      ],
+                          );
+                        },
+                      ),
                     ),
-                  ),
-                  // Right: Status Chip
-                  Container(
-                    margin: const EdgeInsets.only(left: 8),
-                    child: isActive
-                        ? const Chip(
-                      label: Text('Active'),
-                      backgroundColor: Colors.orange,
-                      labelStyle: TextStyle(color: Colors.white, fontSize: 11),
-                      padding: EdgeInsets.symmetric(horizontal: 4),
-                    )
-                        : const Chip(
-                      label: Text('Completed'),
-                      backgroundColor: Colors.green,
-                      labelStyle: TextStyle(color: Colors.white, fontSize: 11),
-                      padding: EdgeInsets.symmetric(horizontal: 4),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          );
-        },
-      ),
     );
   }
+}
 
-  void _showRideDetails(BuildContext context, Map<String, dynamic> ride) {
-    showModalBottomSheet(
-      context: context,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-      ),
-      builder: (context) => Container(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text(
-              'Ride Details',
-              style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-            ),
-            const Divider(),
-            _detailTile('Cycle ID', ride['cycle_id'] ?? 'N/A'),
-            _detailTile('Start Stand', ride['start_stand']?['name'] ?? 'Unknown'),
-            _detailTile('Return Stand', ride['return_stand']?['name'] ?? 'In Progress'),
-            _detailTile('Start Time', _formatTime(ride['start_time'])),
-            _detailTile('End Time', _formatTime(ride['end_time'])),
-            _detailTile('Duration', _formatDuration(ride['duration'] ?? 0)),
-            _detailTile('Status', ride['status'] ?? ''),
-          ],
+class _ErrorState extends StatelessWidget {
+  const _ErrorState({required this.message, required this.onRetry});
+  final String message;
+  final VoidCallback onRetry;
+
+  @override
+  Widget build(BuildContext context) => Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            const Icon(Icons.cloud_off, size: 48),
+            const SizedBox(height: 12),
+            Text(message, textAlign: TextAlign.center),
+            const SizedBox(height: 16),
+            FilledButton(onPressed: onRetry, child: const Text('Retry')),
+          ]),
         ),
-      ),
-    );
-  }
-
-  Widget _detailTile(String label, String value) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          SizedBox(
-            width: 100,
-            child: Text(
-              label,
-              style: const TextStyle(fontWeight: FontWeight.w500, color: Colors.grey),
-            ),
-          ),
-          Expanded(
-            child: Text(value),
-          ),
-        ],
-      ),
-    );
-  }
+      );
 }

@@ -1,5 +1,9 @@
 import 'package:flutter/material.dart';
+import 'package:qr_flutter/qr_flutter.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+
+import '../../core/errors/app_exception.dart';
+import '../../services/ride_operation_service.dart';
 
 class AdminCyclesTab extends StatefulWidget {
   const AdminCyclesTab({super.key});
@@ -9,61 +13,402 @@ class AdminCyclesTab extends StatefulWidget {
 }
 
 class _AdminCyclesTabState extends State<AdminCyclesTab> {
-  List<Map<String, dynamic>> _cycles = [];
-  bool _isLoading = true;
+  final _client = Supabase.instance.client;
+  final _operations = RideOperationService();
+  List<Map<String, dynamic>> _cycles = const [];
+  List<Map<String, dynamic>> _stands = const [];
+  bool _loading = true;
+  String? _error;
 
   @override
   void initState() {
     super.initState();
-    _fetchCycles();
+    _load();
   }
 
-  Future<void> _fetchCycles() async {
-    setState(() => _isLoading = true);
+  Future<void> _load() async {
+    if (mounted)
+      setState(() {
+        _loading = true;
+        _error = null;
+      });
     try {
-      final response = await Supabase.instance.client
-          .from('cycles')
-          .select('*');
-      _cycles = List<Map<String, dynamic>>.from(response);
-      print('Cycles loaded: ${_cycles.length}');
-    } catch (e) {
-      print('Error loading cycles: $e');
+      final results = await Future.wait([
+        _client
+            .from('cycles')
+            .select(
+              'id, cycle_number, qr_code, status, stand_id, physical_state, stands(name)',
+            )
+            .order('cycle_number'),
+        _client.from('stands').select('id, name, status').order('name'),
+      ]);
+      if (mounted)
+        setState(() {
+          _cycles = List<Map<String, dynamic>>.from(results[0] as List);
+          _stands = List<Map<String, dynamic>>.from(results[1] as List);
+        });
+    } catch (error) {
+      if (mounted) setState(() => _error = 'Could not load cycles: $error');
+    } finally {
+      if (mounted) setState(() => _loading = false);
     }
-    setState(() => _isLoading = false);
   }
 
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Cycles'),
-        backgroundColor: Colors.green.shade700,
-      ),
-      body: _isLoading
-          ? const Center(child: CircularProgressIndicator())
-          : _cycles.isEmpty
-          ? const Center(child: Text('No cycles found.'))
-          : ListView.builder(
-        padding: const EdgeInsets.all(12),
-        itemCount: _cycles.length,
-        itemBuilder: (context, i) {
-          final cycle = _cycles[i];
-          return Card(
-            elevation: 2,
-            margin: const EdgeInsets.only(bottom: 8),
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(12),
+  Future<void> _addCycle() async {
+    final activeStands = _activeStands;
+    if (activeStands.isEmpty) {
+      if (mounted)
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Enable and configure at least one stand before adding a cycle.',
             ),
-            child: ListTile(
-              title: Text(cycle['id'] ?? 'No ID'),
-              subtitle: Text(
-                'Status: ${cycle['status'] ?? 'N/A'}\n'
-                    'MAC: ${cycle['mac_address'] ?? 'N/A'}',
-              ),
+          ),
+        );
+      return;
+    }
+    final number = TextEditingController();
+    String? standId;
+    final formKey = GlobalKey<FormState>();
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: const Text('Add cycle'),
+          content: Form(
+            key: formKey,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextFormField(
+                  controller: number,
+                  decoration: const InputDecoration(labelText: 'Cycle number'),
+                  validator: (value) =>
+                      value == null || value.trim().isEmpty ? 'Required' : null,
+                ),
+                const SizedBox(height: 12),
+                DropdownButtonFormField<String>(
+                  initialValue: standId,
+                  decoration: const InputDecoration(
+                    labelText: 'Starting stand',
+                  ),
+                  items: activeStands
+                      .map(
+                        (stand) => DropdownMenuItem(
+                          value: stand['id'].toString(),
+                          child: Text(stand['name'].toString()),
+                        ),
+                      )
+                      .toList(),
+                  onChanged: (value) => setDialogState(() => standId = value),
+                  validator: (value) => value == null ? 'Choose a stand' : null,
+                ),
+              ],
             ),
-          );
-        },
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () {
+                if (formKey.currentState!.validate())
+                  Navigator.pop(dialogContext, true);
+              },
+              child: const Text('Add'),
+            ),
+          ],
+        ),
       ),
     );
+    if (confirmed != true || standId == null) return;
+    try {
+      await _client.rpc(
+        'admin_add_cycle',
+        params: {'p_cycle_number': number.text.trim(), 'p_stand_id': standId},
+      );
+      await _load();
+    } catch (error) {
+      if (mounted)
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(_friendlyError('Could not add cycle', error))),
+        );
+    } finally {
+      number.dispose();
+    }
   }
+
+  Future<void> _setStatus(Map<String, dynamic> cycle, String status) async {
+    if (cycle['status'] == 'in_use') {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'An in-use cycle cannot be changed while a ride is active.',
+          ),
+        ),
+      );
+      return;
+    }
+    try {
+      if (status == 'disabled') {
+        await _client.rpc(
+          'admin_remove_cycle',
+          params: {'p_cycle_id': cycle['id']},
+        );
+      } else {
+        final standId = cycle['stand_id']?.toString();
+        if (standId == null || standId.isEmpty)
+          throw const FormatException('Assign the cycle to a stand first.');
+        await _client.rpc(
+          'admin_assign_cycle',
+          params: {'p_cycle_id': cycle['id'], 'p_stand_id': standId},
+        );
+      }
+      await _load();
+    } catch (error) {
+      if (mounted)
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(_friendlyError('Could not update cycle', error)),
+          ),
+        );
+    }
+  }
+
+  Future<void> _move(Map<String, dynamic> cycle) async {
+    if (cycle['status'] == 'in_use') {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'An in-use cycle cannot be moved while a ride is active.',
+          ),
+        ),
+      );
+      return;
+    }
+    final activeStands = _activeStands;
+    if (activeStands.isEmpty) {
+      if (mounted)
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'No active stands are available. Enable a configured stand first.',
+            ),
+          ),
+        );
+      return;
+    }
+    String? standId = cycle['stand_id']?.toString();
+    if (standId == null ||
+        !activeStands.any((stand) => stand['id'].toString() == standId)) {
+      standId = activeStands.first['id'].toString();
+    }
+    final selected = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setState) => AlertDialog(
+          title: const Text('Assign stand'),
+          content: DropdownButton<String>(
+            value: standId,
+            isExpanded: true,
+            items: activeStands
+                .map(
+                  (stand) => DropdownMenuItem(
+                    value: stand['id'].toString(),
+                    child: Text(stand['name'].toString()),
+                  ),
+                )
+                .toList(),
+            onChanged: (value) => setState(() => standId = value),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('Save'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (selected != true || standId == null) return;
+    try {
+      await _client.rpc(
+        'admin_assign_cycle',
+        params: {'p_cycle_id': cycle['id'], 'p_stand_id': standId},
+      );
+      await _load();
+    } catch (error) {
+      if (mounted)
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(_friendlyError('Could not move cycle', error)),
+          ),
+        );
+    }
+  }
+
+  Future<void> _remove(Map<String, dynamic> cycle) =>
+      _setStatus(cycle, 'disabled');
+
+  Future<void> _verifyInventory(Map<String, dynamic> cycle) async {
+    final standId = cycle['stand_id']?.toString();
+    if (standId == null || standId.isEmpty) {
+      if (mounted)
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Assign this cycle to an active stand first.'),
+          ),
+        );
+      return;
+    }
+    if (cycle['status'] == 'in_use') {
+      if (mounted)
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'An in-use cycle cannot be verified from the admin inventory screen.',
+            ),
+          ),
+        );
+      return;
+    }
+    if (mounted) setState(() => _loading = true);
+    try {
+      final inventory = await _operations.refreshStandInventory(standId);
+      await _load();
+      if (!mounted) return;
+      final present = inventory['present'] == true;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            present
+                ? 'ESP confirmed the cycle. It is now available.'
+                : 'ESP reported no cycle at this stand.',
+          ),
+        ),
+      );
+    } on AppException catch (error) {
+      if (mounted)
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(error.message)));
+    } catch (error) {
+      if (mounted)
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not verify ESP inventory: $error')),
+        );
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  List<Map<String, dynamic>> get _activeStands =>
+      _stands.where((stand) => stand['status'] == 'active').toList();
+
+  String _friendlyError(String action, Object error) {
+    if (error is PostgrestException &&
+        error.message.toLowerCase().contains('stand is not active')) {
+      return '$action: selected stand is disabled. Enable and configure that stand first.';
+    }
+    if (error is PostgrestException &&
+        error.message.toLowerCase().contains('stand capacity is full')) {
+      return '$action: this stand already has its one cycle slot occupied.';
+    }
+    return '$action: $error';
+  }
+
+  void _showQr(Map<String, dynamic> cycle) => showDialog<void>(
+    context: context,
+    builder: (_) => AlertDialog(
+      title: Text('QR · ${cycle['cycle_number']}'),
+      content: QrImageView(data: cycle['qr_code'].toString(), size: 220),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Close'),
+        ),
+      ],
+    ),
+  );
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    floatingActionButton: FloatingActionButton.extended(
+      onPressed: _loading ? null : _addCycle,
+      icon: const Icon(Icons.add),
+      label: const Text('Cycle'),
+    ),
+    body: _loading
+        ? const Center(child: CircularProgressIndicator())
+        : _error != null
+        ? Center(child: Text(_error!))
+        : RefreshIndicator(
+            onRefresh: _load,
+            child: ListView.separated(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 96),
+              itemCount: _cycles.length,
+              separatorBuilder: (_, __) => const SizedBox(height: 10),
+              itemBuilder: (context, index) {
+                final cycle = _cycles[index];
+                final stand = cycle['stands'] is Map
+                    ? (cycle['stands'] as Map)['name']
+                    : 'Unassigned';
+                final status = cycle['status'].toString();
+                final physical =
+                    cycle['physical_state']?.toString() ?? 'unknown';
+                return Card(
+                  child: ListTile(
+                    leading: Icon(
+                      Icons.pedal_bike,
+                      color: status == 'available'
+                          ? Colors.green
+                          : Colors.orange,
+                    ),
+                    title: Text(cycle['cycle_number'].toString()),
+                    subtitle: Text('$stand · $status · physical: $physical'),
+                    isThreeLine: false,
+                    trailing: PopupMenuButton<String>(
+                      onSelected: (action) {
+                        if (action == 'qr') _showQr(cycle);
+                        if (action == 'move') _move(cycle);
+                        if (action == 'remove') _remove(cycle);
+                        if (action == 'disable') _setStatus(cycle, 'disabled');
+                        if (action == 'verify') _verifyInventory(cycle);
+                      },
+                      itemBuilder: (_) => [
+                        const PopupMenuItem(
+                          value: 'qr',
+                          child: Text('Show QR'),
+                        ),
+                        const PopupMenuItem(
+                          value: 'move',
+                          child: Text('Assign stand'),
+                        ),
+                        if (cycle['stand_id'] != null && status != 'in_use')
+                          const PopupMenuItem(
+                            value: 'verify',
+                            child: Text('Verify ESP inventory'),
+                          ),
+                        const PopupMenuItem(
+                          value: 'remove',
+                          child: Text('Remove cycle'),
+                        ),
+                        if (status != 'disabled')
+                          const PopupMenuItem(
+                            value: 'disable',
+                            child: Text('Disable'),
+                          ),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+  );
 }

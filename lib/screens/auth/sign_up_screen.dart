@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+
+import '../../core/errors/app_exception.dart';
 import '../../providers/auth_provider.dart';
 
 class SignUpScreen extends StatefulWidget {
@@ -10,78 +12,64 @@ class SignUpScreen extends StatefulWidget {
 }
 
 class _SignUpScreenState extends State<SignUpScreen> {
-  final _emailController = TextEditingController();
-  final _passwordController = TextEditingController();
-  final _confirmController = TextEditingController();
-  bool _isLoading = false;
+  final _formKey = GlobalKey<FormState>();
+  final _name = TextEditingController();
+  final _email = TextEditingController();
+  final _phone = TextEditingController();
+  final _registration = TextEditingController();
+  final _password = TextEditingController();
+  final _confirm = TextEditingController();
+  bool _loading = false;
 
-  Future<void> _signUp() async {
-    if (_passwordController.text != _confirmController.text) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Passwords do not match')),
-      );
-      return;
+  @override
+  void dispose() {
+    for (final controller in [_name, _email, _phone, _registration, _password, _confirm]) {
+      controller.dispose();
     }
-    setState(() => _isLoading = true);
-    await context.read<AuthProvider>().signUp(
-      _emailController.text.trim(),
-      _passwordController.text.trim(),
-      context,
-    );
-    setState(() => _isLoading = false);
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    if (_loading || !(_formKey.currentState?.validate() ?? false)) return;
+    setState(() => _loading = true);
+    try {
+      await context.read<AuthProvider>().signUp(
+            name: _name.text,
+            email: _email.text,
+            password: _password.text,
+            phone: _phone.text,
+            registrationId: _registration.text,
+          );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Account created. Check your college email to verify it, then sign in.')));
+        Navigator.pop(context);
+      }
+    } on AppException catch (error) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(error.message)));
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
   }
 
   @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Sign Up'),
-        backgroundColor: Colors.green.shade700,
-      ),
-      body: Padding(
-        padding: const EdgeInsets.all(24.0),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            TextField(
-              controller: _emailController,
-              decoration: const InputDecoration(
-                labelText: 'Email',
-                border: OutlineInputBorder(),
-              ),
-              keyboardType: TextInputType.emailAddress,
-            ),
-            const SizedBox(height: 16),
-            TextField(
-              controller: _passwordController,
-              decoration: const InputDecoration(
-                labelText: 'Password',
-                border: OutlineInputBorder(),
-              ),
-              obscureText: true,
-            ),
-            const SizedBox(height: 16),
-            TextField(
-              controller: _confirmController,
-              decoration: const InputDecoration(
-                labelText: 'Confirm Password',
-                border: OutlineInputBorder(),
-              ),
-              obscureText: true,
-            ),
-            const SizedBox(height: 24),
-            _isLoading
-                ? const CircularProgressIndicator()
-                : ElevatedButton(
-              onPressed: _signUp,
-              style: ElevatedButton.styleFrom(
-                minimumSize: const Size(double.infinity, 50),
-              ),
-              child: const Text('Create Account'),
-            ),
-          ],
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(title: const Text('Create account')),
+        body: SafeArea(
+          child: Form(
+            key: _formKey,
+            child: ListView(padding: const EdgeInsets.all(24), children: [
+              TextFormField(controller: _name, decoration: const InputDecoration(labelText: 'Full name'), validator: _required),
+              TextFormField(controller: _email, keyboardType: TextInputType.emailAddress, decoration: const InputDecoration(labelText: 'College email'), validator: _required),
+              TextFormField(controller: _phone, keyboardType: TextInputType.phone, decoration: const InputDecoration(labelText: 'Phone'), validator: _required),
+              TextFormField(controller: _registration, decoration: const InputDecoration(labelText: 'Registration ID'), validator: _required),
+              TextFormField(controller: _password, obscureText: true, decoration: const InputDecoration(labelText: 'Password (8+ characters)'), validator: (value) => (value ?? '').length >= 8 ? null : 'Use at least 8 characters'),
+              TextFormField(controller: _confirm, obscureText: true, decoration: const InputDecoration(labelText: 'Confirm password'), validator: (value) => value == _password.text ? null : 'Passwords do not match'),
+              const SizedBox(height: 24),
+              FilledButton(onPressed: _loading ? null : _submit, child: _loading ? const CircularProgressIndicator() : const Text('Create account')),
+            ]),
+          ),
         ),
-      ),
-    );
-  }
+      );
+
+  String? _required(String? value) => (value ?? '').trim().isEmpty ? 'Required' : null;
 }

@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
 class FeedbackScreen extends StatefulWidget {
   const FeedbackScreen({super.key});
@@ -8,79 +9,49 @@ class FeedbackScreen extends StatefulWidget {
 }
 
 class _FeedbackScreenState extends State<FeedbackScreen> {
-  final TextEditingController _controller = TextEditingController();
+  final _controller = TextEditingController();
+  bool _loading = false;
 
-  void _submit() {
-    final text = _controller.text.trim();
-    if (text.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please write your feedback first')),
-      );
+  @override
+  void dispose() { _controller.dispose(); super.dispose(); }
+
+  Future<void> _submit() async {
+    final message = _controller.text.trim();
+    if (message.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Please write your feedback first.')));
       return;
     }
-    showDialog(
-      context: context,
-      builder: (_) => AlertDialog(
-        title: const Text('Thank You!'),
-        content: Text('We received: "$text"'),
-        actions: [
-          TextButton(
-            onPressed: () {
-              _controller.clear();
-              Navigator.pop(context);
-            },
-            child: const Text('OK'),
-          ),
-        ],
-      ),
-    );
+    if (message.length > 2000) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Feedback must be 2,000 characters or fewer.')));
+      return;
+    }
+    setState(() => _loading = true);
+    try {
+      final user = Supabase.instance.client.auth.currentUser;
+      if (user == null) throw const AuthException('Please sign in again.');
+      await Supabase.instance.client.from('feedback').insert({'user_id': user.id, 'message': message});
+      _controller.clear();
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Thanks — your feedback was sent.')));
+    } on PostgrestException catch (error) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Could not send feedback: ${error.message}')));
+    } on AuthException catch (error) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(error.message)));
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
   }
 
   @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('Feedback')),
-      body: Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text('Write your feedback', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 16),
-            Card(
-              elevation: 2,
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-              child: Padding(
-                padding: const EdgeInsets.all(12),
-                child: TextField(
-                  controller: _controller,
-                  maxLines: 8,
-                  decoration: InputDecoration(
-                    hintText: 'Share your experience with CycleOne...',
-                    border: InputBorder.none,
-                    filled: true,
-                    fillColor: Colors.grey.shade50,
-                  ),
-                ),
-              ),
-            ),
-            const SizedBox(height: 30),
-            ElevatedButton.icon(
-              onPressed: _submit,
-              icon: const Icon(Icons.send),
-              label: const Text('Submit Feedback'),
-              style: ElevatedButton.styleFrom(
-                minimumSize: const Size(double.infinity, 50),
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
-              ),
-            ),
-            const Spacer(),
-            const Center(
-              child: Text('Your feedback helps us improve', style: TextStyle(color: Colors.grey)),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(title: const Text('Feedback')),
+        body: ListView(padding: const EdgeInsets.all(24), children: [
+          Text('Help us improve CycleOne', style: Theme.of(context).textTheme.titleLarge),
+          const SizedBox(height: 8),
+          const Text('Tell the campus mobility team what worked and what could be better.'),
+          const SizedBox(height: 20),
+          TextField(controller: _controller, maxLines: 8, maxLength: 2000, decoration: const InputDecoration(labelText: 'Your feedback', hintText: 'Share your experience…')),
+          const SizedBox(height: 16),
+          FilledButton.icon(onPressed: _loading ? null : _submit, icon: _loading ? const SizedBox.square(dimension: 18, child: CircularProgressIndicator(strokeWidth: 2)) : const Icon(Icons.send), label: Text(_loading ? 'Sending…' : 'Send feedback')),
+        ]),
+      );
 }

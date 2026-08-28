@@ -52,19 +52,34 @@ class _MainScreenState extends State<MainScreen> {
   List<BottomNavigationBarItem> get _navItems {
     final isAdmin = context.watch<AuthProvider>().isAdmin;
     final items = <BottomNavigationBarItem>[
-      const BottomNavigationBarItem(icon: Icon(Icons.directions_bike), label: 'Cycle'),
+      const BottomNavigationBarItem(
+        icon: Icon(Icons.directions_bike),
+        label: 'Cycle',
+      ),
       const BottomNavigationBarItem(icon: Icon(Icons.map), label: 'Map'),
       const BottomNavigationBarItem(icon: Icon(Icons.person), label: 'Profile'),
       // const BottomNavigationBarItem(icon: Icon(Icons.history), label: 'History'),
-      const BottomNavigationBarItem(icon: Icon(Icons.feedback), label: 'Feedback'),
-      const BottomNavigationBarItem(icon: Icon(Icons.location_on), label: 'Permissions'),
-      const BottomNavigationBarItem(icon: Icon(Icons.history), label: 'History'),
+      const BottomNavigationBarItem(
+        icon: Icon(Icons.feedback),
+        label: 'Feedback',
+      ),
+      const BottomNavigationBarItem(
+        icon: Icon(Icons.location_on),
+        label: 'Permissions',
+      ),
+      const BottomNavigationBarItem(
+        icon: Icon(Icons.history),
+        label: 'History',
+      ),
     ];
     if (isAdmin) {
-      items.insert(3, const BottomNavigationBarItem(
-        icon: Icon(Icons.admin_panel_settings),
-        label: 'Admin',
-      ));
+      items.insert(
+        3,
+        const BottomNavigationBarItem(
+          icon: Icon(Icons.admin_panel_settings),
+          label: 'Admin',
+        ),
+      );
     }
     return items;
   }
@@ -100,10 +115,7 @@ class _MainScreenState extends State<MainScreen> {
         }
       },
       child: Scaffold(
-        body: IndexedStack(
-          index: _selectedIndex,
-          children: screens,
-        ),
+        body: IndexedStack(index: _selectedIndex, children: screens),
         bottomNavigationBar: BottomNavigationBar(
           currentIndex: _selectedIndex,
           onTap: (index) {
@@ -120,7 +132,7 @@ class _MainScreenState extends State<MainScreen> {
             }
           },
           type: BottomNavigationBarType.fixed,
-          backgroundColor: Colors.white,
+          backgroundColor: Colors.white.withAlpha(225),
           selectedItemColor: Colors.green,
           unselectedItemColor: Colors.grey,
           items: navItems,
