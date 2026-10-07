@@ -23,7 +23,12 @@ serve(async (request) => {
     const status = body.status === 'active' || body.status === 'disabled' ? body.status : (body.isBlocked === true ? 'disabled' : body.isBlocked === false ? 'active' : null);
     if (!userId || !status) return json({ error: 'userId and status are required' }, 400);
     if (userId === user.id) return json({ error: 'You cannot disable your own account' }, 400);
-    const { error } = await admin.from('profiles').update({ status }).eq('id', userId);
+    // Use the admin RPC so the profile protection trigger sees the original
+    // administrator JWT instead of a service-role request with no auth.uid().
+    const { error } = await caller.rpc('admin_set_user_status', {
+      p_user_id: userId,
+      p_status: status,
+    });
     if (error) return json({ error: error.message }, 400);
     return json({ success: true, status });
   } catch (error) {

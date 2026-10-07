@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import '../services/settings_service.dart'; // we'll create this
+import '../services/settings_service.dart';
 
 class SplashScreen extends StatefulWidget {
   const SplashScreen({super.key});
@@ -12,16 +12,23 @@ class _SplashScreenState extends State<SplashScreen> {
   @override
   void initState() {
     super.initState();
-    // Show splash for 2 seconds, then check maintenance
+    // Give the splash artwork time to render, then check release state.
     Future.delayed(const Duration(seconds: 2), () {
       _checkMaintenance();
     });
   }
 
   Future<void> _checkMaintenance() async {
+    final update = await SettingsService.checkForUpdate();
     final bool isUnderMaintenance = await SettingsService.isMaintenanceMode();
     if (mounted) {
-      if (isUnderMaintenance) {
+      if (update != null && update.mandatory) {
+        Navigator.pushReplacementNamed(
+          context,
+          '/update',
+          arguments: update,
+        );
+      } else if (isUnderMaintenance) {
         Navigator.pushReplacementNamed(context, '/maintenance');
       } else {
         Navigator.pushReplacementNamed(context, '/home');

@@ -3,6 +3,8 @@ import 'package:qr_flutter/qr_flutter.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:uuid/uuid.dart';
 
+import '../../models/esp_endpoint.dart';
+
 class AdminStandsTab extends StatefulWidget {
   const AdminStandsTab({super.key});
 
@@ -64,7 +66,26 @@ class _AdminStandsTabState extends State<AdminStandsTab> {
           actions: [TextButton(onPressed: () => Navigator.pop(dialogContext, false), child: const Text('Cancel')), FilledButton(onPressed: () { if (formKey.currentState!.validate()) Navigator.pop(dialogContext, true); }, child: const Text('Save'))],
         ));
     if (saved != true) { for (final c in [name, location, mac, ssid, password, ip, port, capacity, latitude, longitude]) c.dispose(); return; }
-    final normalizedMac = mac.text.trim().toUpperCase();
+    final normalizedMac = EspEndpoint.normalizeMac(mac.text.trim());
+    if (normalizedMac.isEmpty) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Enter a valid ESP MAC such as AA:BB:CC:DD:EE:FF.')));
+      for (final c in [name, location, mac, ssid, password, ip, port, capacity, latitude, longitude]) c.dispose();
+      return;
+    }
+    final editingId = stand?['id']?.toString();
+    Map<String, dynamic>? duplicate;
+    for (final item in _stands) {
+      if (item['id']?.toString() != editingId &&
+          EspEndpoint.normalizeMac(item['esp_mac']?.toString() ?? '') == normalizedMac) {
+        duplicate = item;
+        break;
+      }
+    }
+    if (duplicate != null) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('This ESP MAC is already assigned to ${duplicate['name'] ?? 'another stand'}.')));
+      for (final c in [name, location, mac, ssid, password, ip, port, capacity, latitude, longitude]) c.dispose();
+      return;
+    }
     final values = <String, dynamic>{
       'name': name.text.trim(), 'location': location.text.trim(), 'esp_mac': normalizedMac,
       'esp_ssid': ssid.text.trim(), 'esp_password': password.text,
@@ -131,7 +152,12 @@ class _AdminStandsTabState extends State<AdminStandsTab> {
                     itemBuilder: (context, index) {
                       final stand = _stands[index];
                       final cycles = (stand['cycles'] as List?)?.whereType<Map>().toList() ?? const [];
-                      final available = cycles.where((cycle) => cycle['status'] == 'available').length;
+                      // A row marked absent is retained for audit, but it no
+                      // longer occupies a physical slot or contributes to the
+                      // stand's available count.
+                      final available = cycles.where((cycle) =>
+                          cycle['status'] == 'available' &&
+                          cycle['physical_state'] != 'absent').length;
                       final active = stand['status'] == 'active';
                       return Card(child: ListTile(
                         leading: Icon(Icons.storefront, color: active ? Colors.green : Colors.grey),

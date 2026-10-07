@@ -3,15 +3,24 @@ import '../core/errors/app_exception.dart';
 enum QrKind { cycle, stand }
 
 class QrPayload {
-  const QrPayload._(this.kind, this.id);
+  const QrPayload._(this.kind, this.id, {this.isMac = false});
 
   final QrKind kind;
   final String id;
+  final bool isMac;
 
   /// Accepts only the canonical, server-resolved CycleOne QR form.
   /// No MAC address or arbitrary device address is trusted from a QR code.
   factory QrPayload.parse(String raw, {required QrKind expectedKind}) {
-    final uri = Uri.tryParse(raw.trim());
+    final value = raw.trim();
+    // Cycle labels are generated from the assigned ESP MAC without colons,
+    // for example A1B2C3D4E5F6. Stand QR codes remain URI-based.
+    if (expectedKind == QrKind.cycle &&
+        RegExp(r'^[0-9a-f]{12}$', caseSensitive: false).hasMatch(value)) {
+      return QrPayload._(QrKind.cycle, value.toUpperCase(), isMac: true);
+    }
+
+    final uri = Uri.tryParse(value);
     if (uri == null || uri.scheme != 'cycleone') {
       throw const AppException('This is not a CycleOne QR code.');
     }

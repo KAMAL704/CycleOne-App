@@ -10,8 +10,12 @@ import '../models/esp_endpoint.dart';
 enum LockAction { unlock, lock }
 
 class HardwareTransition {
-  const HardwareTransition.changed() : changed = true, alreadyInRequestedState = false;
-  const HardwareTransition.alreadyRequested() : changed = false, alreadyInRequestedState = true;
+  const HardwareTransition.changed()
+    : changed = true,
+      alreadyInRequestedState = false;
+  const HardwareTransition.alreadyRequested()
+    : changed = false,
+      alreadyInRequestedState = true;
 
   final bool changed;
   final bool alreadyInRequestedState;
@@ -27,7 +31,8 @@ class EspPhysicalState {
 /// Native ESP transport. T commands are deliberately never retried: a lost
 /// response is ambiguous because the relay may already have moved.
 class ESPLockService {
-  ESPLockService({MethodChannel? channel}) : _channel = channel ?? _defaultChannel;
+  ESPLockService({MethodChannel? channel})
+    : _channel = channel ?? _defaultChannel;
 
   static const _defaultChannel = MethodChannel('cycleone/esp_wifi');
   static const int _tokenLength = 40;
@@ -40,11 +45,16 @@ class ESPLockService {
 
   Future<void> ensurePermissions() async {
     final location = await Permission.locationWhenInUse.request();
-    if (!location.isGranted) throw const AppException('Location permission is required to connect to a nearby stand.');
+    if (!location.isGranted)
+      throw const AppException(
+        'Location permission is required to connect to a nearby stand.',
+      );
     try {
       final nearby = await Permission.nearbyWifiDevices.request();
       if (!nearby.isGranted && !nearby.isLimited) {
-        throw const AppException('Nearby Wi-Fi permission is required to connect to a stand.');
+        throw const AppException(
+          'Nearby Wi-Fi permission is required to connect to a stand.',
+        );
       }
     } on UnsupportedError {
       // Not exposed on the current platform/API level.
@@ -52,25 +62,45 @@ class ESPLockService {
   }
 
   Future<void> connect(EspEndpoint endpoint) async {
-    if (_connectedEndpoint?.mac == endpoint.mac && await isConnected()) return;
+    if (_connectedEndpoint?.mac == endpoint.mac) {
+      if (await isConnected()) return;
+
+      // The original senior firmware closes its TCP client after each S/U/T
+      // command. Reopen only that socket while retaining the already-bound
+      // Android Wi-Fi network, so the next command does not show another
+      // Wi-Fi confirmation dialog.
+      try {
+        final reopened = await _channel
+            .invokeMethod<bool>('reopenEspSocket')
+            .timeout(const Duration(seconds: 12));
+        if (reopened == true) return;
+      } catch (_) {
+        // Fall through to a complete connection request below.
+      }
+    }
     await disconnect();
     try {
       AppLogger.info('ESP', 'Connecting to expected BSSID ${endpoint.mac}');
-      final connected = await _channel.invokeMethod<bool>('connectToEsp', {
-        'mac': endpoint.mac,
-        'ssid': endpoint.ssid,
-        'password': endpoint.password,
-        'ip': endpoint.host,
-        'port': endpoint.port,
-      }).timeout(const Duration(seconds: 30));
-      if (connected != true) throw const AppException('The requested stand could not be reached.');
+      final connected = await _channel
+          .invokeMethod<bool>('connectToEsp', {
+            'mac': endpoint.mac,
+            'ssid': endpoint.ssid,
+            'password': endpoint.password,
+            'ip': endpoint.host,
+            'port': endpoint.port,
+          })
+          .timeout(const Duration(seconds: 30));
+      if (connected != true)
+        throw const AppException('The requested stand could not be reached.');
       _connectedEndpoint = endpoint;
       AppLogger.info('ESP', 'Connected to exact requested BSSID');
     } on PlatformException catch (error, stackTrace) {
       AppLogger.error('WIFI', error, stackTrace);
       throw AppException(_connectionMessage(error.code));
     } on TimeoutException {
-      throw const AppException('Connection to the stand timed out. Make sure it is powered and nearby.');
+      throw const AppException(
+        'Connection to the stand timed out. Make sure it is powered and nearby.',
+      );
     }
   }
 
@@ -85,23 +115,41 @@ class ESPLockService {
   /// Reads the stand's physical inventory status without pulsing the relay.
   /// The firmware returns lock state plus a presence-sensor result. Firmware
   /// without a sensor uses locked-as-present as a conservative fallback.
-  Future<EspPhysicalState> readPresence(EspEndpoint endpoint) async {
+  Future<EspPhysicalState> readPresence(
+    EspEndpoint endpoint, {
+    bool keepConnection = false,
+  }) async {
     await ensurePermissions();
+    var completed = false;
     try {
       await connect(endpoint);
-      final raw = await _channel.invokeMethod<dynamic>('getPresenceStatus').timeout(const Duration(seconds: 12));
+      final raw = await _channel
+          .invokeMethod<dynamic>('getPresenceStatus')
+          .timeout(const Duration(seconds: 12));
       final values = List<int>.from(raw as List);
-      if (values.length != 2 || !values.every((value) => value == 0 || value == 1)) {
-        throw const AppException('The stand returned an invalid physical inventory state.');
+      if (values.length != 2 ||
+          !values.every((value) => value == 0 || value == 1)) {
+        throw const AppException(
+          'The stand returned an invalid physical inventory state.',
+        );
       }
-      return EspPhysicalState(locked: values[0] == _locked, cyclePresent: values[1] == 1);
+      completed = true;
+      return EspPhysicalState(
+        locked: values[0] == _locked,
+        cyclePresent: values[1] == 1,
+      );
     } on PlatformException catch (error, stackTrace) {
       AppLogger.error('ESP_PRESENCE', error, stackTrace);
       throw AppException(_connectionMessage(error.code));
     } on TimeoutException {
-      throw const AppException('The stand did not return its inventory state in time.');
+      throw const AppException(
+        'The stand did not return its inventory state in time.',
+      );
     } finally {
-      await disconnect();
+      // A ride operation immediately follows inventory with U/T. Reusing the
+      // same bound network avoids a second Android Wi-Fi confirmation dialog.
+      // Failed reads still clean up; successful standalone reads close.
+      if (!keepConnection || !completed) await disconnect();
     }
   }
 
@@ -121,14 +169,18 @@ class ESPLockService {
     required String cycleId,
     required String standId,
   }) async {
-    if (_commandInProgress) throw const AppException('Another lock operation is already in progress.');
+    if (_commandInProgress)
+      throw const AppException(
+        'Another lock operation is already in progress.',
+      );
     _commandInProgress = true;
     try {
       await ensurePermissions();
       await connect(endpoint);
       final expectedState = action == LockAction.unlock ? _unlocked : _locked;
       final before = await _status();
-      if (before == expectedState) return const HardwareTransition.alreadyRequested();
+      if (before == expectedState)
+        return const HardwareTransition.alreadyRequested();
 
       final token = await _sendU();
       final transformed = await _transformToken(
@@ -149,14 +201,20 @@ class ESPLockService {
           await connect(endpoint);
           final observed = await _status();
           if (observed != expectedState) throw error;
-          AppLogger.info('ESP', 'Recovered physical state after ambiguous T response');
+          AppLogger.info(
+            'ESP',
+            'Recovered physical state after ambiguous T response',
+          );
         } catch (_) {
           throw error;
         }
       }
 
       final after = await _status();
-      if (after != expectedState) throw const AppException('The stand did not confirm the requested physical lock state.');
+      if (after != expectedState)
+        throw const AppException(
+          'The stand did not confirm the requested physical lock state.',
+        );
       AppLogger.info('ESP', '${action.name} state confirmed');
       return const HardwareTransition.changed();
     } finally {
@@ -167,46 +225,70 @@ class ESPLockService {
 
   Future<int> _status() async {
     try {
-      final value = await _channel.invokeMethod<int>('getStatus').timeout(const Duration(seconds: 12));
-      if (value != _locked && value != _unlocked) throw const AppException('The stand returned an invalid lock state.');
+      final value = await _channel
+          .invokeMethod<int>('getStatus')
+          .timeout(const Duration(seconds: 12));
+      if (value != _locked && value != _unlocked)
+        throw const AppException('The stand returned an invalid lock state.');
       return value!;
     } on PlatformException catch (error, stackTrace) {
       AppLogger.error('TCP', error, stackTrace);
       throw AppException(_connectionMessage(error.code));
     } on TimeoutException {
-      throw const AppException('The stand did not respond in time. Please try another powered stand.');
+      throw const AppException(
+        'The stand did not respond in time. Please try another powered stand.',
+      );
     }
   }
 
   Future<Uint8List> _sendU() async {
     try {
       AppLogger.info('TCP', 'Sending U');
-      final raw = await _channel.invokeMethod<dynamic>('sendU').timeout(const Duration(seconds: 12));
+      final raw = await _channel
+          .invokeMethod<dynamic>('sendU')
+          .timeout(const Duration(seconds: 12));
       final response = Uint8List.fromList(List<int>.from(raw as List));
-      if (response.length != 41 || response.first != 0) throw const AppException('The stand rejected its secure token request.');
+      if (response.length != 41 || response.first != 0)
+        throw const AppException(
+          'The stand rejected its secure token request.',
+        );
       return Uint8List.fromList(response.sublist(1));
     } on PlatformException catch (error, stackTrace) {
       AppLogger.error('TCP', error, stackTrace);
       throw AppException(_connectionMessage(error.code));
     } on TimeoutException {
-      throw const AppException('The stand did not return its secure token in time.');
+      throw const AppException(
+        'The stand did not return its secure token in time.',
+      );
     }
   }
 
   Future<void> _sendT(Uint8List token) async {
-    if (token.length != _tokenLength) throw const AppException('The secure lock token is invalid.');
+    if (token.length != _tokenLength)
+      throw const AppException('The secure lock token is invalid.');
     try {
       AppLogger.info('TCP', 'Sending T');
-      final success = await _channel.invokeMethod<bool>('sendT', {'token': token.toList()}).timeout(const Duration(seconds: 12));
-      if (success != true) throw const AppException('The stand rejected the physical lock command.');
+      final success = await _channel
+          .invokeMethod<bool>('sendT', {'token': token.toList()})
+          .timeout(const Duration(seconds: 12));
+      if (success != true)
+        throw const AppException(
+          'The stand rejected the physical lock command.',
+        );
     } on PlatformException catch (error, stackTrace) {
       AppLogger.error('TCP', error, stackTrace);
       if (error.code.startsWith('ESP_T_')) {
-        throw const AppException('The lock response was lost. The physical state is being checked; do not retry another cycle.', code: 'HARDWARE_AMBIGUOUS');
+        throw const AppException(
+          'The lock response was lost. The physical state is being checked; do not retry another cycle.',
+          code: 'HARDWARE_AMBIGUOUS',
+        );
       }
       throw AppException(_connectionMessage(error.code));
     } on TimeoutException {
-      throw const AppException('The lock command response was lost. The physical state is being checked; do not retry immediately.', code: 'HARDWARE_AMBIGUOUS');
+      throw const AppException(
+        'The lock command response was lost. The physical state is being checked; do not retry immediately.',
+        code: 'HARDWARE_AMBIGUOUS',
+      );
     }
   }
 
@@ -219,33 +301,56 @@ class ESPLockService {
   }) async {
     try {
       AppLogger.info('AES', 'Requesting server-side token transformation');
-      final response = await Supabase.instance.client.functions.invoke('transform-token', body: {
-        'token': token.toList(),
-        'action': action.name,
-        'mac': endpoint.mac,
-        'cycleId': cycleId,
-        'standId': standId,
-      });
+      final response = await Supabase.instance.client.functions.invoke(
+        'transform-token',
+        body: {
+          'token': token.toList(),
+          'action': action.name,
+          'mac': endpoint.mac,
+          'cycleId': cycleId,
+          'standId': standId,
+        },
+      );
       final data = response.data;
-      if (response.status != 200 || data is! Map || data['success'] != true || data['macVerified'] != true) {
-        throw const AppException('The server could not authorize this lock operation.');
+      if (response.status != 200 ||
+          data is! Map ||
+          data['success'] != true ||
+          data['macVerified'] != true) {
+        throw const AppException(
+          'The server could not authorize this lock operation.',
+        );
       }
       final transformed = data['transformedToken'];
       if (transformed is! List || transformed.length != _tokenLength) {
-        throw const AppException('The server returned an invalid secure lock token.');
+        throw const AppException(
+          'The server returned an invalid secure lock token.',
+        );
       }
-      return Uint8List.fromList(transformed.cast<num>().map((byte) => byte.toInt()).toList());
+      return Uint8List.fromList(
+        transformed.cast<num>().map((byte) => byte.toInt()).toList(),
+      );
     } on FunctionException catch (error, stackTrace) {
       AppLogger.error('AES', error, stackTrace);
-      throw const AppException('The server could not authorize this lock operation.');
+      throw const AppException(
+        'The server could not authorize this lock operation.',
+      );
     }
   }
 
   String _connectionMessage(String code) => switch (code) {
-        'PERMISSION_DENIED' => 'Nearby Wi-Fi permission is required to connect to the stand.',
-        'WIFI_UNAVAILABLE' || 'WIFI_TIMEOUT' => 'The requested stand is unavailable. Make sure it is powered and nearby.',
-        'BSSID_MISMATCH' => 'The phone reached a different stand, so the operation was stopped safely.',
-        'ESP_CONNECTION' || 'SOCKET_ERROR' => 'Connection to the cycle lock was lost. Please make sure the stand is powered on and try again.',
-        _ => 'Unable to communicate with this stand. Please try again while nearby.',
-      };
+    'PERMISSION_DENIED' =>
+      'Nearby Wi-Fi permission is required to connect to the stand.',
+    'WIFI_UNAVAILABLE' || 'WIFI_TIMEOUT' =>
+      'The requested stand is unavailable. Make sure it is powered and nearby.',
+    'BSSID_MISMATCH' =>
+      'The phone reached a different stand, so the operation was stopped safely.',
+    'ESP_CONNECTION' || 'SOCKET_ERROR' =>
+      'Connection to the cycle lock was lost. Please make sure the stand is powered on and try again.',
+    'ESP_PRESENCE' || 'ESP_PRESENCE_ERROR' || 'ESP_PRESENCE_DEVICE' ||
+    'ESP_STATUS' || 'ESP_STATUS_ERROR' || 'ESP_STATUS_TIMEOUT' ||
+    'ESP_U_RESPONSE' || 'ESP_U_ERROR' || 'ESP_U_TIMEOUT' =>
+      'Wi-Fi connected, but this ESP did not answer the lock command. Reflash the senior sketch with the reliable server loop and try again.',
+    _ =>
+      'Unable to communicate with this stand. Please try again while nearby.',
+  };
 }

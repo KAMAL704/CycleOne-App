@@ -9,6 +9,7 @@ import 'screens/auth/sign_in_screen.dart';
 import 'screens/main_screen.dart';
 import 'screens/maintenace_screen.dart';
 import 'screens/splash_screen.dart';
+import 'screens/update_required_screen.dart';
 import 'widgets/cinematic_background.dart';
 
 Future<void> main() async {
@@ -98,6 +99,7 @@ class CycleOneApp extends StatelessWidget {
         '/splash': (_) => const SplashScreen(),
         '/home': (_) => const AuthWrapper(),
         '/maintenance': (_) => const MaintenanceScreen(),
+        '/update': (_) => const UpdateRequiredScreen(),
       },
     ),
   );

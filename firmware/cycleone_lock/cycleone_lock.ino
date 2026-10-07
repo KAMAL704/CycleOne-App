@@ -1,13 +1,16 @@
 // CycleOne ESP8266 smart-lock firmware.
 // Binary TCP protocol: S -> 2 bytes, P -> 3 bytes, U -> 41 bytes,
 // T+40 bytes -> 41 bytes.
-// Install the Arduino Cryptography Library through PlatformIO and create
-// secrets.h from secrets.example.h before compiling.
+// Install the ESP8266-compatible CryptoAES_CBC library and create secrets.h
+// from secrets.example.h before compiling.
 
 #include <Arduino.h>
 #include <EEPROM.h>
 #include <ESP8266WiFi.h>
 #include <user_interface.h>
+// CryptoAES_CBC is the ESP8266-compatible fork. It intentionally exposes
+// the same AES/CBC headers but encrypt()/decrypt() return void.
+#include <CryptoAES_CBC.h>
 #include <AES.h>
 #include <CBC.h>
 #include "secrets.h"
@@ -170,20 +173,24 @@ void setLockState(uint8_t nextState) {
 
 bool encryptPayload(const uint8_t* payload, const uint8_t* iv, uint8_t* ciphertext) {
   CBC<AES128> cbc;
-  cbc.setKey(aesKey, sizeof(aesKey));
-  cbc.setIV(iv, 16);
-  const size_t written = cbc.encrypt(ciphertext, payload, kPayloadLength);
+  if (!cbc.setKey(aesKey, sizeof(aesKey)) || !cbc.setIV(iv, 16)) {
+    cbc.clear();
+    return false;
+  }
+  cbc.encrypt(ciphertext, payload, kPayloadLength);
   cbc.clear();
-  return written == kPayloadLength;
+  return true;
 }
 
 bool decryptPayload(const uint8_t* ciphertext, const uint8_t* iv, uint8_t* payload) {
   CBC<AES128> cbc;
-  cbc.setKey(aesKey, sizeof(aesKey));
-  cbc.setIV(iv, 16);
-  const size_t written = cbc.decrypt(payload, ciphertext, kPayloadLength);
+  if (!cbc.setKey(aesKey, sizeof(aesKey)) || !cbc.setIV(iv, 16)) {
+    cbc.clear();
+    return false;
+  }
+  cbc.decrypt(payload, ciphertext, kPayloadLength);
   cbc.clear();
-  return written == kPayloadLength;
+  return true;
 }
 
 void handleU(WiFiClient& client) {
@@ -218,7 +225,10 @@ void handleT(WiFiClient& client) {
   if (!decryptPayload(token + 24, token + 8, payload) ||
       !equalBytes(payload, token, 8) ||
       !equalBytes(payload + 9, ownMac, 6) ||
-      payload[15] != kProtocolVersion ||
+      // Version 0 is the senior app's legacy token. It authenticates the
+      // same nonce and AP MAC but has no protocol-version byte; accepting it
+      // keeps this controller interoperable with both app generations.
+      (payload[15] != 0 && payload[15] != kProtocolVersion) ||
       (payload[8] != kLocked && payload[8] != kUnlocked)) {
     writeTokenError(client, kStatusUnauthorised);
     return;

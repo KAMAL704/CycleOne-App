@@ -107,22 +107,46 @@ Deno.serve(async (request) => {
     const { data: stand } = await admin.from('stands').select('id, esp_mac, status, capacity').eq('id', standId).maybeSingle();
     if (!stand || stand.status !== 'active' || normalizeMac(stand.esp_mac) !== expectedMac) return response({ error: 'Stand authorization failed' }, 403);
 
+    // An admin test assignment is deliberately independent of the normal
+    // cycle/ride inventory state.  It still has to be bound to this user,
+    // cycle, selected stand and verified ESP MAC before a relay command can be
+    // transformed.
+    const { data: testAssignment } = await admin
+      .from('admin_test_cycle_assignments')
+      .select('id, user_id, cycle_id, stand_id, status, phase')
+      .eq('user_id', user.id)
+      .eq('cycle_id', cycleId)
+      .eq('status', 'assigned')
+      .maybeSingle();
+    const testMode = testAssignment != null;
+
     if (action === 'unlock') {
-      const { data: activeRide } = await admin.from('rides').select('id').eq('user_id', user.id).eq('status', 'active').maybeSingle();
-      const { data: cycle } = await admin.from('cycles').select('id, physical_state').eq('id', cycleId).eq('stand_id', standId).eq('status', 'available').maybeSingle();
-      if (activeRide || !cycle || cycle.physical_state === 'absent') return response({ error: 'Cycle unlock is not authorized' }, 403);
+      if (testMode) {
+        if (testAssignment.phase !== 'assigned' ||
+            (testAssignment.stand_id != null && testAssignment.stand_id !== standId)) {
+          return response({ error: 'Test cycle is not assigned to this stand' }, 403);
+        }
+      } else {
+        const { data: activeRide } = await admin.from('rides').select('id').eq('user_id', user.id).eq('status', 'active').maybeSingle();
+        const { data: cycle } = await admin.from('cycles').select('id, physical_state').eq('id', cycleId).eq('stand_id', standId).eq('status', 'available').maybeSingle();
+        if (activeRide || !cycle || cycle.physical_state === 'absent') return response({ error: 'Cycle unlock is not authorized' }, 403);
+      }
     } else {
-      const { data: activeRide } = await admin.from('rides').select('id').eq('user_id', user.id).eq('cycle_id', cycleId).eq('status', 'active').maybeSingle();
-      if (!activeRide) return response({ error: 'Cycle return is not authorized' }, 403);
-      const { data: parkedCycles, error: capacityError } = await admin
-        .from('cycles')
-        .select('id')
-        .eq('stand_id', standId)
-        .in('status', ['available', 'maintenance', 'disabled'])
-        .neq('physical_state', 'absent');
-      if (capacityError) return response({ error: 'Stand capacity could not be verified' }, 503);
-      if ((parkedCycles?.length ?? 0) >= Number(stand.capacity ?? 0)) {
-        return response({ error: 'Destination stand is full' }, 409);
+      if (testMode) {
+        if (testAssignment.phase !== 'unlocked') return response({ error: 'Test cycle is not currently unlocked' }, 403);
+      } else {
+        const { data: activeRide } = await admin.from('rides').select('id').eq('user_id', user.id).eq('cycle_id', cycleId).eq('status', 'active').maybeSingle();
+        if (!activeRide) return response({ error: 'Cycle return is not authorized' }, 403);
+        const { data: parkedCycles, error: capacityError } = await admin
+          .from('cycles')
+          .select('id')
+          .eq('stand_id', standId)
+          .in('status', ['available', 'maintenance', 'disabled'])
+          .neq('physical_state', 'absent');
+        if (capacityError) return response({ error: 'Stand capacity could not be verified' }, 503);
+        if ((parkedCycles?.length ?? 0) >= Number(stand.capacity ?? 0)) {
+          return response({ error: 'Destination stand is full' }, 409);
+        }
       }
     }
 

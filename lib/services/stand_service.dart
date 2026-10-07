@@ -19,7 +19,19 @@ class StandService {
           )
           .eq('status', 'active')
           .order('name');
-      return List<Map<String, dynamic>>.from(rows);
+      // A cycle that the ESP has confirmed absent is not occupying a physical
+      // dock slot. Hide such stale assignment rows from map/selector counts;
+      // the admin cycle screen still shows them for audit and repair.
+      return List<Map<String, dynamic>>.from(rows).map((stand) {
+        final cycles = stand['cycles'];
+        if (cycles is List) {
+          stand['cycles'] = cycles
+              .whereType<Map>()
+              .where((cycle) => cycle['physical_state'] != 'absent')
+              .toList();
+        }
+        return stand;
+      }).toList();
     } catch (error, stackTrace) {
       AppLogger.error('SUPABASE', error, stackTrace);
       throw _error('We could not load campus stands.', error);

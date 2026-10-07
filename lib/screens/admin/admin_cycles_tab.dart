@@ -3,6 +3,7 @@ import 'package:qr_flutter/qr_flutter.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../../core/errors/app_exception.dart';
+import '../../models/esp_endpoint.dart';
 import '../../services/ride_operation_service.dart';
 
 class AdminCyclesTab extends StatefulWidget {
@@ -37,7 +38,7 @@ class _AdminCyclesTabState extends State<AdminCyclesTab> {
         _client
             .from('cycles')
             .select(
-              'id, cycle_number, qr_code, status, stand_id, physical_state, stands(name)',
+              'id, cycle_number, qr_code, esp_mac, status, stand_id, physical_state, stands(name, esp_mac)',
             )
             .order('cycle_number'),
         _client.from('stands').select('id, name, status').order('name'),
@@ -255,6 +256,29 @@ class _AdminCyclesTabState extends State<AdminCyclesTab> {
   Future<void> _remove(Map<String, dynamic> cycle) =>
       _setStatus(cycle, 'disabled');
 
+  Future<void> _clearStaleAssignment(Map<String, dynamic> cycle) async {
+    if (cycle['status'] == 'in_use') return;
+    try {
+      // An ESP-confirmed absent row is historical inventory, not a parked
+      // cycle. Keep the cycle record, but clear the guessed stand so an admin
+      // can assign its real location and verify that stand's ESP.
+      await _client.rpc(
+        'admin_assign_cycle',
+        params: {'p_cycle_id': cycle['id'], 'p_stand_id': null},
+      );
+      await _load();
+    } catch (error) {
+      if (mounted)
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              _friendlyError('Could not clear stale assignment', error),
+            ),
+          ),
+        );
+    }
+  }
+
   Future<void> _verifyInventory(Map<String, dynamic> cycle) async {
     final standId = cycle['stand_id']?.toString();
     if (standId == null || standId.isEmpty) {
@@ -322,19 +346,54 @@ class _AdminCyclesTabState extends State<AdminCyclesTab> {
     return '$action: $error';
   }
 
-  void _showQr(Map<String, dynamic> cycle) => showDialog<void>(
-    context: context,
-    builder: (_) => AlertDialog(
-      title: Text('QR · ${cycle['cycle_number']}'),
-      content: QrImageView(data: cycle['qr_code'].toString(), size: 220),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(context),
-          child: const Text('Close'),
+  String? _cycleQrData(Map<String, dynamic> cycle) {
+    final directMac = EspEndpoint.normalizeMac(
+      cycle['esp_mac']?.toString() ?? '',
+    );
+    if (directMac.isNotEmpty) return directMac.replaceAll(':', '');
+    final stand = cycle['stands'];
+    if (stand is Map) {
+      final standMac = EspEndpoint.normalizeMac(
+        stand['esp_mac']?.toString() ?? '',
+      );
+      if (standMac.isNotEmpty) return standMac.replaceAll(':', '');
+    }
+    return null;
+  }
+
+  void _showQr(Map<String, dynamic> cycle) {
+    final qrData = _cycleQrData(cycle);
+    if (qrData == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'This cycle has no valid ESP MAC yet. Verify or assign its stand first.',
+          ),
         ),
-      ],
-    ),
-  );
+      );
+      return;
+    }
+    showDialog<void>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: Text('QR · ${cycle['cycle_number']}'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            QrImageView(data: qrData, size: 220),
+            const SizedBox(height: 12),
+            SelectableText(qrData, textAlign: TextAlign.center),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) => Scaffold(
@@ -379,6 +438,7 @@ class _AdminCyclesTabState extends State<AdminCyclesTab> {
                         if (action == 'remove') _remove(cycle);
                         if (action == 'disable') _setStatus(cycle, 'disabled');
                         if (action == 'verify') _verifyInventory(cycle);
+                        if (action == 'unassign') _clearStaleAssignment(cycle);
                       },
                       itemBuilder: (_) => [
                         const PopupMenuItem(
@@ -393,6 +453,13 @@ class _AdminCyclesTabState extends State<AdminCyclesTab> {
                           const PopupMenuItem(
                             value: 'verify',
                             child: Text('Verify ESP inventory'),
+                          ),
+                        if (cycle['stand_id'] != null &&
+                            physical == 'absent' &&
+                            status != 'in_use')
+                          const PopupMenuItem(
+                            value: 'unassign',
+                            child: Text('Clear stale stand assignment'),
                           ),
                         const PopupMenuItem(
                           value: 'remove',

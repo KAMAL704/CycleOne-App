@@ -188,7 +188,7 @@ class _MapScreenState extends State<MapScreen> {
                 contentPadding: EdgeInsets.zero,
                 leading: const Icon(Icons.directions_bike),
                 title: const Text('Available Cycles'),
-                trailing: Text('$available / ${cycles.length}'),
+                trailing: Text('$available / ${stand['capacity'] ?? cycles.length}'),
               ),
               ListTile(
                 contentPadding: EdgeInsets.zero,
@@ -453,7 +453,7 @@ class _MapScreenState extends State<MapScreen> {
                               ),
                               title: Text(stand['name'] ?? 'Unknown'),
                               subtitle: Text(
-                                '$available available (${cycles.length} total)',
+                                '$available available (${stand['capacity'] ?? cycles.length} slots)',
                               ),
                               trailing: Row(
                                 mainAxisSize: MainAxisSize.min,

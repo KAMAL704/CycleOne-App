@@ -108,13 +108,38 @@ update public.profiles set role = 'admin' where email = 'kamal_254034051@sliet.a
 
    Arduino IDE is also supported. Install the ESP8266 board package using
    `https://arduino.esp8266.com/stable/package_esp8266com_index.json`, select
-   **NodeMCU 1.0 (ESP-12E Module)**, and install the **Crypto** library by
-   Rhys Weatherley from Library Manager. Open
+   **NodeMCU 1.0 (ESP-12E Module)**, and install **CryptoAES_CBC** by Piotr
+   Obst from Library Manager. This ESP8266-compatible fork provides the
+   required `AES.h` and `CBC.h` headers. Open
    `firmware/cycleone_lock/cycleone_lock.ino`; keep the copied `secrets.h` in
    the same folder, select the ESP serial port, then use **Verify** followed
    by **Upload**. Open Serial Monitor at `115200` baud.
 
 4. Read the controller's AP BSSID from the serial log or the access point scan. In the Admin → Stands screen, create a stand with that exact `esp_mac`, the same SSID/password, `10.10.10.10`, port `80`, capacity, and coordinates.
+
+### Verify the exact controller from the app
+
+1. Leave the controller powered and make sure the serial `s` command reports
+   `locked`. With `CYCLEONE_HAS_PRESENCE_SENSOR 0`, this is the conservative
+   `present` signal used for the first test.
+2. In Admin → Stands → ⋮ → Edit, paste only the value after `BSSID=` (for
+   example `AA:BB:CC:DD:EE:FF`) into **ESP MAC**. Save the same SSID,
+   password, IP, and port, then enable the stand.
+3. In Admin → Cycles, assign one test cycle to this stand and choose **Verify
+   ESP inventory**. A successful message says that the ESP confirmed the
+   cycle and the cycle becomes `available`; this proves the Wi-Fi connection,
+   exact BSSID, TCP protocol, AES key, and inventory RPC.
+4. Use a test rider account in the Cycle tab and choose that cycle. Accept the
+   Android Wi-Fi/location permission prompt. A successful start ends with
+   `Ride started. The cycle is unlocked.` and pulses D7. After physically
+   returning the bicycle, choose the same stand (or scan its stand QR); a
+   successful return pulses D6 and completes the ride.
+
+The app has no blind unlock button: an unlock is allowed only for an available
+cycle and a return only for the rider's active ride. A `BSSID_MISMATCH` or
+`Stand authorization failed` error means the saved MAC is not the controller's
+AP BSSID; a stand-unavailable error means the ESP is powered, nearby, and
+broadcasting the configured SSID must be checked first.
 
 The controller speaks a framed binary protocol:
 
@@ -127,9 +152,90 @@ The controller speaks a framed binary protocol:
 
 The ESP persists `locked`/`unlocked` in EEPROM and does not pulse the relay when the requested state is already set. With the optional reed/IR sensor enabled in `secrets.h`, `P` reports actual bicycle presence; without a sensor it conservatively treats a locked dock as occupied.
 
-Use this repository firmware rather than the older sketch that uses
-`ESP_EEPROM.h`, `CryptoAES_CBC.h`, or the legacy response format. The app
-expects `P` and the authenticated 40-byte `U`/`T` framing shown above.
+The Android bridge also supports the senior/legacy controller: if `P` is not
+implemented, it falls back to `S` and infers presence from the lock state.
+The repository firmware accepts both the current version byte and the legacy
+version-zero token. If you flash the senior sketch itself, change its relay
+macros to D6/D7 if those are the pins wired on your board, and make its access
+point visible with `WiFi.softAP(SERVER_SSID, SERVER_PASS, 1, false, 4)`.
+The legacy sketch does not have a physical presence sensor, so its inventory
+is necessarily `locked = present`.
+
+A complete dual-compatible sketch is included at
+`firmware/cycleone_senior_legacy/cycleone_senior_legacy.ino`. Open that file
+directly in Arduino IDE (do not place it beside another `.ino` in the same
+folder), select NodeMCU 1.0 (ESP-12E Module), and upload it. It keeps the
+senior S/U/T protocol and adds the current app's P inventory command. It uses
+D6 for lock, D7 for unlock, and broadcasts the visible `CycleOneS1` access
+point. For this sketch use **74880 baud** in Serial Monitor (the original
+senior sketch's setting).
+
+The senior sketch must also wait for TCP bytes after accepting a client. Its
+original `if (client.available())` check is racy and can produce “Wi-Fi
+connected, ESP unavailable”. The complete sketch above already applies this
+fix; the older pattern is shown below only for reference:
+
+```cpp
+WiFiClient client = server.available();
+if (client) {
+  const uint32_t started = millis();
+  while (!client.available() && client.connected() && millis() - started < 2000) {
+    delay(1);
+    yield();
+  }
+  if (client.available()) {
+    switch (client.read()) {
+      case 'S':
+        client.write((uint8_t)0);
+        client.write((uint8_t)unlocked);
+        break;
+      case 'U':
+        sendStatusWithoutRfidPing(&client, false);
+        break;
+      case 'T':
+        handleTrigger(&client);
+        break;
+    }
+    client.flush();
+  }
+  client.stop();
+}
+```
+
+In `handleTrigger`, replace the single `client->read(req, 40)` call with an
+exact-length read loop; TCP is allowed to deliver the 40-byte token in more
+than one packet. Without that change, an unlock/return can still fail
+intermittently even after Wi-Fi connects.
+
+Use this helper before `handleTrigger` and call it as shown:
+
+```cpp
+bool readExact(WiFiClient *client, uint8_t *bytes, size_t length, uint32_t timeoutMs) {
+  size_t received = 0;
+  const uint32_t started = millis();
+  while (received < length && client->connected() && millis() - started < timeoutMs) {
+    while (client->available() && received < length) {
+      const int value = client->read();
+      if (value < 0) return false;
+      bytes[received++] = (uint8_t)value;
+    }
+    delay(1);
+    yield();
+  }
+  return received == length;
+}
+```
+
+Then in `handleTrigger` use:
+
+```cpp
+uint8_t reqBytes[40];
+if (!readExact(client, reqBytes, sizeof(reqBytes), 5000)) {
+  sendError(client, "Invalid data length");
+  return;
+}
+uint8_t *req = reqBytes;
+```
 
 The student map uses Google Maps on Android/iOS and the Google Maps JavaScript
 loader on web. Restrict the supplied API key in Google Cloud Console by app

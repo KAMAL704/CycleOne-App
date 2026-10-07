@@ -201,6 +201,16 @@ class MainActivity : FlutterActivity() {
                     )
                 }
 
+                // The original senior sketch handles one command per TCP
+                // connection. Reopen only the socket while retaining the
+                // already-authorized Android Wi-Fi network.
+                "reopenEspSocket" -> {
+
+                    reopenEspSocket(
+                        result
+                    )
+                }
+
                 "sendU" -> {
 
                     sendU(
@@ -1028,30 +1038,22 @@ class MainActivity : FlutterActivity() {
 
                 try {
 
-                    if (
-                        !isSocketAlive()
-                    ) {
+                    // The supplied senior firmware is one-shot: it handles
+                    // one command and then releases its WiFiClient. Always
+                    // start U on a fresh TCP socket.
+                    closeSocket()
+                    if (!reconnectTcp()) {
 
-                        Log.w(
-                            TAG,
-                            "Socket not alive. Reconnecting..."
-                        )
+                        handler.post {
 
-                        if (
-                            !reconnectTcp()
-                        ) {
-
-                            handler.post {
-
-                                result.error(
-                                    "ESP_CONNECTION",
-                                    "ESP connection lost.",
-                                    null
-                                )
-                            }
-
-                            return@synchronized
+                            result.error(
+                                "ESP_CONNECTION",
+                                "ESP connection lost.",
+                                null
+                            )
                         }
+
+                        return@synchronized
                     }
 
                     val inputStream =
@@ -1148,6 +1150,8 @@ class MainActivity : FlutterActivity() {
                         TAG,
                         "U status byte=$status"
                     )
+
+                    closeSocket()
 
                     /*
                      * Flutter ESPLockService accepts:
@@ -1255,30 +1259,21 @@ class MainActivity : FlutterActivity() {
                         return@synchronized
                     }
 
-                    if (
-                        !isSocketAlive()
-                    ) {
+                    // The supplied senior firmware closes its client after T;
+                    // never append T to a previous S/U connection.
+                    closeSocket()
+                    if (!reconnectTcp()) {
 
-                        Log.w(
-                            TAG,
-                            "Socket not alive before T. Reconnecting..."
-                        )
+                        handler.post {
 
-                        if (
-                            !reconnectTcp()
-                        ) {
-
-                            handler.post {
-
-                                result.error(
-                                    "ESP_CONNECTION",
-                                    "ESP connection lost.",
-                                    null
-                                )
-                            }
-
-                            return@synchronized
+                            result.error(
+                                "ESP_CONNECTION",
+                                "ESP connection lost.",
+                                null
+                            )
                         }
+
+                        return@synchronized
                     }
 
                     val inputStream =
@@ -1406,6 +1401,8 @@ class MainActivity : FlutterActivity() {
                         "T status=$status"
                     )
 
+                    closeSocket()
+
                     /*
                      * ESP status:
                      *
@@ -1483,30 +1480,21 @@ class MainActivity : FlutterActivity() {
 
                 try {
 
-                    if (
-                        !isSocketAlive()
-                    ) {
+                    // S is also a one-shot request for the supplied senior
+                    // sketch, so do not reuse a socket after any command.
+                    closeSocket()
+                    if (!reconnectTcp()) {
 
-                        Log.w(
-                            TAG,
-                            "Socket not alive before S. Reconnecting..."
-                        )
+                        handler.post {
 
-                        if (
-                            !reconnectTcp()
-                        ) {
-
-                            handler.post {
-
-                                result.error(
-                                    "ESP_CONNECTION",
-                                    "ESP not connected.",
-                                    null
-                                )
-                            }
-
-                            return@synchronized
+                            result.error(
+                                "ESP_CONNECTION",
+                                "ESP not connected.",
+                                null
+                            )
                         }
+
+                        return@synchronized
                     }
 
                     val inputStream =
@@ -1600,6 +1588,8 @@ class MainActivity : FlutterActivity() {
                         "S response: status=$status state=$state"
                     )
 
+                    closeSocket()
+
                     if (
                         status != 0
                     ) {
@@ -1680,7 +1670,10 @@ class MainActivity : FlutterActivity() {
             synchronized(commandLock) {
 
                 try {
-                    if (!isSocketAlive() && !reconnectTcp()) {
+                    // P is a one-shot request on both the supplied senior
+                    // sketch (which ignores it) and the current firmware.
+                    closeSocket()
+                    if (!reconnectTcp()) {
                         handler.post { result.error("ESP_CONNECTION", "ESP not connected.", null) }
                         return@synchronized
                     }
@@ -1693,19 +1686,60 @@ class MainActivity : FlutterActivity() {
                     clearInput(inputStream)
                     outputStream.write('P'.code)
                     outputStream.flush()
-                    val response = readExact(inputStream, PRESENCE_RESPONSE_SIZE, 5000)
-                    if (response == null || response.size != PRESENCE_RESPONSE_SIZE) {
+                    // P is a one-byte command on current firmware. Keep the
+                    // probe short so a senior controller that does not know P
+                    // can fall back to S without a long apparent hang.
+                    val response = readExact(inputStream, PRESENCE_RESPONSE_SIZE, 1500)
+                    if (response != null && response.size == PRESENCE_RESPONSE_SIZE) {
+                        val status = response[0].toInt().and(0xFF)
+                        if (status != 0) {
+                            handler.post { result.error("ESP_PRESENCE_DEVICE", "ESP returned status=$status", status) }
+                            return@synchronized
+                        }
+                        val lockState = response[1].toInt().and(0xFF)
+                        val present = response[2].toInt().and(0xFF)
+                        if (lockState !in 0..1 || present !in 0..1) {
+                            handler.post { result.error("ESP_PRESENCE_DEVICE", "ESP returned an invalid physical state.", null) }
+                            return@synchronized
+                        }
                         closeSocket()
-                        handler.post { result.error("ESP_PRESENCE", "Invalid presence response. Expected 3 bytes.", null) }
+                        handler.post { result.success(listOf(lockState, present)) }
                         return@synchronized
                     }
-                    val status = response[0].toInt().and(0xFF)
-                    if (status != 0) {
-                        handler.post { result.error("ESP_PRESENCE_DEVICE", "ESP returned status=$status", status) }
+
+                    // The senior firmware predates P and closes/ignores that
+                    // command. Its S response has the same lock-state byte;
+                    // with no physical sensor, locked is the legacy presence
+                    // signal expected by the current app.
+                    Log.w(TAG, "P is not supported; falling back to legacy S inventory status")
+                    closeSocket()
+                    if (!reconnectTcp()) {
+                        handler.post { result.error("ESP_PRESENCE", "The ESP did not support the inventory command.", null) }
                         return@synchronized
                     }
-                    val lockState = response[1].toInt().and(0xFF)
-                    val present = response[2].toInt().and(0xFF)
+                    val legacyInputStream = input
+                    val legacyOutputStream = output
+                    if (legacyInputStream == null || legacyOutputStream == null) {
+                        handler.post { result.error("ESP_STREAM", "ESP stream unavailable.", null) }
+                        return@synchronized
+                    }
+                    clearInput(legacyInputStream)
+                    legacyOutputStream.write('S'.code)
+                    legacyOutputStream.flush()
+                    val legacy = readExact(legacyInputStream, STATUS_RESPONSE_SIZE, 5000)
+                    if (legacy == null || legacy.size != STATUS_RESPONSE_SIZE) {
+                        closeSocket()
+                        handler.post { result.error("ESP_PRESENCE", "Invalid legacy inventory response. Expected 2 bytes.", null) }
+                        return@synchronized
+                    }
+                    val status = legacy[0].toInt().and(0xFF)
+                    val lockState = legacy[1].toInt().and(0xFF)
+                    if (status != 0 || lockState !in 0..1) {
+                        handler.post { result.error("ESP_PRESENCE_DEVICE", "ESP returned an invalid legacy state.", status) }
+                        return@synchronized
+                    }
+                    val present = if (lockState == 0) 1 else 0
+                    closeSocket()
                     handler.post { result.success(listOf(lockState, present)) }
                 } catch (e: Exception) {
                     Log.e(TAG, "Presence command error", e)
@@ -1719,6 +1753,34 @@ class MainActivity : FlutterActivity() {
     // ============================================================
     // RECONNECT TCP
     // ============================================================
+
+    private fun reopenEspSocket(
+        result: MethodChannel.Result
+    ) {
+
+        Thread {
+
+            synchronized(commandLock) {
+
+                closeSocket()
+
+                val reopened = reconnectTcp()
+
+                handler.post {
+
+                    if (reopened) {
+                        result.success(true)
+                    } else {
+                        result.error(
+                            "ESP_CONNECTION",
+                            "ESP TCP socket could not be reopened.",
+                            null
+                        )
+                    }
+                }
+            }
+        }.start()
+    }
 
     private fun reconnectTcp():
             Boolean {
