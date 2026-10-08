@@ -16,6 +16,7 @@ class AdminCyclesTab extends StatefulWidget {
 class _AdminCyclesTabState extends State<AdminCyclesTab> {
   final _client = Supabase.instance.client;
   final _operations = RideOperationService();
+  final _searchController = TextEditingController();
   List<Map<String, dynamic>> _cycles = const [];
   List<Map<String, dynamic>> _stands = const [];
   bool _loading = true;
@@ -24,7 +25,33 @@ class _AdminCyclesTabState extends State<AdminCyclesTab> {
   @override
   void initState() {
     super.initState();
+    _searchController.addListener(() {
+      if (mounted) setState(() {});
+    });
     _load();
+  }
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  List<Map<String, dynamic>> get _visibleCycles {
+    final query = _searchController.text.trim().toLowerCase();
+    if (query.isEmpty) return _cycles;
+    return _cycles.where((cycle) {
+      final stand = cycle['stands'];
+      final searchable = [
+        cycle['cycle_number'],
+        cycle['status'],
+        cycle['physical_state'],
+        cycle['esp_mac'],
+        if (stand is Map) stand['name'],
+        if (stand is Map) stand['esp_mac'],
+      ].whereType<Object>().join(' ').toLowerCase();
+      return searchable.contains(query);
+    }).toList();
   }
 
   Future<void> _load() async {
@@ -90,6 +117,8 @@ class _AdminCyclesTabState extends State<AdminCyclesTab> {
                 const SizedBox(height: 12),
                 DropdownButtonFormField<String>(
                   initialValue: standId,
+                  dropdownColor: Colors.white,
+                  style: const TextStyle(color: Colors.black87),
                   decoration: const InputDecoration(
                     labelText: 'Starting stand',
                   ),
@@ -213,6 +242,8 @@ class _AdminCyclesTabState extends State<AdminCyclesTab> {
           content: DropdownButton<String>(
             value: standId,
             isExpanded: true,
+            dropdownColor: Colors.white,
+            style: const TextStyle(color: Colors.black87),
             items: activeStands
                 .map(
                   (stand) => DropdownMenuItem(
@@ -331,6 +362,73 @@ class _AdminCyclesTabState extends State<AdminCyclesTab> {
     }
   }
 
+  Future<void> _renameCycle(Map<String, dynamic> cycle) async {
+    final controller = TextEditingController(
+      text: cycle['cycle_number']?.toString() ?? '',
+    );
+    final formKey = GlobalKey<FormState>();
+    final saved = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        backgroundColor: Colors.white,
+        surfaceTintColor: Colors.transparent,
+        title: const Text('Edit cycle name'),
+        content: Form(
+          key: formKey,
+          child: TextFormField(
+            controller: controller,
+            autofocus: true,
+            decoration: const InputDecoration(
+              labelText: 'Cycle number / name',
+              hintText: 'Example: 300',
+            ),
+            validator: (value) => value == null || value.trim().isEmpty
+                ? 'Enter a cycle name'
+                : null,
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () {
+              if (formKey.currentState!.validate()) {
+                Navigator.pop(dialogContext, true);
+              }
+            },
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    if (saved != true) {
+      controller.dispose();
+      return;
+    }
+    try {
+      await _client.rpc(
+        'admin_rename_cycle',
+        params: {
+          'p_cycle_id': cycle['id'],
+          'p_cycle_number': controller.text.trim(),
+        },
+      );
+      await _load();
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(_friendlyError('Could not rename cycle', error)),
+          ),
+        );
+      }
+    } finally {
+      controller.dispose();
+    }
+  }
+
   List<Map<String, dynamic>> get _activeStands =>
       _stands.where((stand) => stand['status'] == 'active').toList();
 
@@ -406,76 +504,133 @@ class _AdminCyclesTabState extends State<AdminCyclesTab> {
         ? const Center(child: CircularProgressIndicator())
         : _error != null
         ? Center(child: Text(_error!))
-        : RefreshIndicator(
-            onRefresh: _load,
-            child: ListView.separated(
-              padding: const EdgeInsets.fromLTRB(16, 16, 16, 96),
-              itemCount: _cycles.length,
-              separatorBuilder: (_, __) => const SizedBox(height: 10),
-              itemBuilder: (context, index) {
-                final cycle = _cycles[index];
-                final stand = cycle['stands'] is Map
-                    ? (cycle['stands'] as Map)['name']
-                    : 'Unassigned';
-                final status = cycle['status'].toString();
-                final physical =
-                    cycle['physical_state']?.toString() ?? 'unknown';
-                return Card(
-                  child: ListTile(
-                    leading: Icon(
-                      Icons.pedal_bike,
-                      color: status == 'available'
-                          ? Colors.green
-                          : Colors.orange,
-                    ),
-                    title: Text(cycle['cycle_number'].toString()),
-                    subtitle: Text('$stand · $status · physical: $physical'),
-                    isThreeLine: false,
-                    trailing: PopupMenuButton<String>(
-                      onSelected: (action) {
-                        if (action == 'qr') _showQr(cycle);
-                        if (action == 'move') _move(cycle);
-                        if (action == 'remove') _remove(cycle);
-                        if (action == 'disable') _setStatus(cycle, 'disabled');
-                        if (action == 'verify') _verifyInventory(cycle);
-                        if (action == 'unassign') _clearStaleAssignment(cycle);
-                      },
-                      itemBuilder: (_) => [
-                        const PopupMenuItem(
-                          value: 'qr',
-                          child: Text('Show QR'),
-                        ),
-                        const PopupMenuItem(
-                          value: 'move',
-                          child: Text('Assign stand'),
-                        ),
-                        if (cycle['stand_id'] != null && status != 'in_use')
-                          const PopupMenuItem(
-                            value: 'verify',
-                            child: Text('Verify ESP inventory'),
+        : Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 14, 16, 8),
+                child: TextField(
+                  controller: _searchController,
+                  decoration: InputDecoration(
+                    labelText: 'Search cycles',
+                    hintText: 'Cycle number, stand, MAC or status',
+                    prefixIcon: const Icon(Icons.search),
+                    suffixIcon: _searchController.text.isEmpty
+                        ? null
+                        : IconButton(
+                            onPressed: _searchController.clear,
+                            icon: const Icon(Icons.clear),
                           ),
-                        if (cycle['stand_id'] != null &&
-                            physical == 'absent' &&
-                            status != 'in_use')
-                          const PopupMenuItem(
-                            value: 'unassign',
-                            child: Text('Clear stale stand assignment'),
-                          ),
-                        const PopupMenuItem(
-                          value: 'remove',
-                          child: Text('Remove cycle'),
-                        ),
-                        if (status != 'disabled')
-                          const PopupMenuItem(
-                            value: 'disable',
-                            child: Text('Disable'),
-                          ),
-                      ],
+                    filled: true,
+                    fillColor: Colors.white.withAlpha(235),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(16),
                     ),
                   ),
-                );
-              },
-            ),
+                ),
+              ),
+              Expanded(
+                child: RefreshIndicator(
+                  onRefresh: _load,
+                  child: _visibleCycles.isEmpty
+                      ? ListView(
+                          children: [
+                            Padding(
+                              padding: const EdgeInsets.all(36),
+                              child: Text(
+                                _cycles.isEmpty
+                                    ? 'No cycles found.'
+                                    : 'No cycles match your search.',
+                                textAlign: TextAlign.center,
+                              ),
+                            ),
+                          ],
+                        )
+                      : ListView.separated(
+                          padding: const EdgeInsets.fromLTRB(16, 8, 16, 96),
+                          itemCount: _visibleCycles.length,
+                          separatorBuilder: (_, __) =>
+                              const SizedBox(height: 10),
+                          itemBuilder: (context, index) {
+                            final cycle = _visibleCycles[index];
+                            final stand = cycle['stands'] is Map
+                                ? (cycle['stands'] as Map)['name']
+                                : 'Unassigned';
+                            final status = cycle['status'].toString();
+                            final physical =
+                                cycle['physical_state']?.toString() ??
+                                'unknown';
+                            return Card(
+                              child: ListTile(
+                                leading: Icon(
+                                  Icons.pedal_bike,
+                                  color: status == 'available'
+                                      ? Colors.green
+                                      : Colors.orange,
+                                ),
+                                title: Text(cycle['cycle_number'].toString()),
+                                subtitle: Text(
+                                  '$stand · $status · physical: $physical',
+                                ),
+                                isThreeLine: false,
+                                trailing: PopupMenuButton<String>(
+                                  onSelected: (action) {
+                                    if (action == 'qr') _showQr(cycle);
+                                    if (action == 'move') _move(cycle);
+                                    if (action == 'remove') _remove(cycle);
+                                    if (action == 'disable')
+                                      _setStatus(cycle, 'disabled');
+                                    if (action == 'verify')
+                                      _verifyInventory(cycle);
+                                    if (action == 'unassign')
+                                      _clearStaleAssignment(cycle);
+                                    if (action == 'rename') _renameCycle(cycle);
+                                  },
+                                  itemBuilder: (_) => [
+                                    const PopupMenuItem(
+                                      value: 'qr',
+                                      child: Text('Show QR'),
+                                    ),
+                                    const PopupMenuItem(
+                                      value: 'move',
+                                      child: Text('Assign stand'),
+                                    ),
+                                    const PopupMenuItem(
+                                      value: 'rename',
+                                      child: Text('Edit cycle name'),
+                                    ),
+                                    if (cycle['stand_id'] != null &&
+                                        status != 'in_use')
+                                      const PopupMenuItem(
+                                        value: 'verify',
+                                        child: Text('Verify ESP inventory'),
+                                      ),
+                                    if (cycle['stand_id'] != null &&
+                                        physical == 'absent' &&
+                                        status != 'in_use')
+                                      const PopupMenuItem(
+                                        value: 'unassign',
+                                        child: Text(
+                                          'Clear stale stand assignment',
+                                        ),
+                                      ),
+                                    const PopupMenuItem(
+                                      value: 'remove',
+                                      child: Text('Remove cycle'),
+                                    ),
+                                    if (status != 'disabled')
+                                      const PopupMenuItem(
+                                        value: 'disable',
+                                        child: Text('Disable'),
+                                      ),
+                                  ],
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+                ),
+              ),
+            ],
           ),
   );
 }

@@ -122,6 +122,8 @@ class _AdminTestControlTabState extends State<AdminTestControlTab> {
                   DropdownButtonFormField<String>(
                     initialValue: userId,
                     isExpanded: true,
+                    dropdownColor: Colors.white,
+                    style: const TextStyle(color: Colors.black87),
                     decoration: const InputDecoration(labelText: 'User'),
                     items: _users
                         .map(
@@ -142,6 +144,8 @@ class _AdminTestControlTabState extends State<AdminTestControlTab> {
                   DropdownButtonFormField<String>(
                     initialValue: cycleId,
                     isExpanded: true,
+                    dropdownColor: Colors.white,
+                    style: const TextStyle(color: Colors.black87),
                     decoration: const InputDecoration(labelText: 'Cycle'),
                     items: _cycles
                         .map(

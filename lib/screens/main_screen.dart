@@ -97,7 +97,7 @@ class _MainScreenState extends State<MainScreen> {
           context: context,
           builder: (context) => AlertDialog(
             title: const Text('Exit App'),
-            content: const Text('Do you want to exit CycleOne?'),
+            content: const Text('Do you want to exit CycleOne App?'),
             actions: [
               TextButton(
                 onPressed: () => Navigator.pop(context, false),

@@ -45,6 +45,10 @@ class CycleOneApp extends StatelessWidget {
           surfaceTintColor: Colors.transparent,
           elevation: 0,
         ),
+        dialogTheme: const DialogThemeData(
+          backgroundColor: Colors.white,
+          surfaceTintColor: Colors.transparent,
+        ),
         inputDecorationTheme: const InputDecorationTheme(
           border: OutlineInputBorder(),
         ),

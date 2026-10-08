@@ -17,6 +17,11 @@ Future<StandSelection?> showStandSelectorBottomSheet(
   context: context,
   isScrollControlled: true,
   useSafeArea: true,
+  backgroundColor: Colors.white,
+  barrierColor: Colors.black54,
+  shape: const RoundedRectangleBorder(
+    borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+  ),
   builder: (_) => _StandSelector(forReturn: forReturn),
 );
 
@@ -98,6 +103,11 @@ class _StandSelectorState extends State<_StandSelector> {
       if (!mounted) return;
       final cycle = await showModalBottomSheet<Map<String, dynamic>>(
         context: context,
+        backgroundColor: Colors.white,
+        barrierColor: Colors.black54,
+        shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+        ),
         builder: (context) => ListView(
           children: [
             const ListTile(title: Text('Choose a cycle')),

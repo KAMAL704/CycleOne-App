@@ -91,7 +91,7 @@ class _SplashScreenState extends State<SplashScreen> {
               ),
               const SizedBox(height: 8),
               const Text(
-                'Thanking Dr. Amit Kansal',
+                'Thanking Dr. Manoj Sir(Faculty Advisor)',
                 style: TextStyle(fontSize: 14, color: Colors.grey),
               ),
             ],
