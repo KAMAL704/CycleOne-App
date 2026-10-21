@@ -19,16 +19,13 @@ class StandService {
           )
           .eq('status', 'active')
           .order('name');
-      // A cycle that the ESP has confirmed absent is not occupying a physical
-      // dock slot. Hide such stale assignment rows from map/selector counts;
-      // the admin cycle screen still shows them for audit and repair.
+      // Keep absent rows available to the UI. They are excluded from the
+      // available count by the physical-state check, but remain useful when
+      // a rider needs to understand why a stand currently has no bicycle.
       return List<Map<String, dynamic>>.from(rows).map((stand) {
         final cycles = stand['cycles'];
         if (cycles is List) {
-          stand['cycles'] = cycles
-              .whereType<Map>()
-              .where((cycle) => cycle['physical_state'] != 'absent')
-              .toList();
+          stand['cycles'] = cycles.whereType<Map>().toList();
         }
         return stand;
       }).toList();
