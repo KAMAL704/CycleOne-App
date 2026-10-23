@@ -427,7 +427,7 @@ class _AdminStandsTabState extends State<AdminStandsTab> {
                                 .where(
                                   (cycle) =>
                                       cycle['status'] == 'available' &&
-                                      cycle['physical_state'] != 'absent',
+                                      cycle['physical_state'] == 'present',
                                 )
                                 .length;
                             final active = stand['status'] == 'active';

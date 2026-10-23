@@ -95,11 +95,15 @@ class RideOperationService {
       throw const AppException('No test cycle is assigned to your account.');
     }
     if (assignment['test_phase'] != 'assigned') {
-      throw const AppException('This test cycle is already unlocked. Choose a return stand.');
+      throw const AppException(
+        'This test cycle is already unlocked. Choose a return stand.',
+      );
     }
     final activeRide = await _cycles.getActiveRide();
     if (activeRide != null && activeRide['test_mode'] != true) {
-      throw const AppException('Finish your real ride before starting a test cycle.');
+      throw const AppException(
+        'Finish your real ride before starting a test cycle.',
+      );
     }
     final cycleId = assignment['cycle_id']?.toString();
     if (cycleId == null || cycleId.isEmpty) {
@@ -140,6 +144,36 @@ class RideOperationService {
     final standId = stand['id'].toString();
     final userId = Supabase.instance.client.auth.currentUser?.id;
     if (userId == null) throw const AppException('Please sign in again.');
+    final pending = await _pending.load();
+    if (pending != null) {
+      if (!pending.matches(
+        PendingOperationType.start,
+        cycleId,
+        standId,
+        userId,
+      )) {
+        throw const AppException(
+          'A previous lock operation still needs recovery. Repeat the same cycle and stand operation first.',
+        );
+      }
+      // The relay has already been verified for this exact cycle/stand. Do
+      // not read inventory again or pulse the relay a second time; only retry
+      // the idempotent server ride commit.
+      progress?.call('Recovering your ride on the server…');
+      try {
+        final ride = await _cycles.startRide(
+          cycleId: cycleId,
+          standId: standId,
+          espMac: EspEndpoint.fromStand(stand).mac,
+        );
+        await _pending.clear();
+        return ride;
+      } on AppException {
+        throw const AppException(
+          'Recovery is still waiting for the server. Reconnect to the internet and repeat the same cycle selection; the lock will not pulse again.',
+        );
+      }
+    }
     var transitionStarted = false;
     try {
       // Keep the verified ESP connection for the immediately following U/T
@@ -153,18 +187,6 @@ class RideOperationService {
           inventory['cycle_id']?.toString() != cycleId) {
         throw const AppException(
           'The selected ESP reports that this stand does not contain that cycle.',
-        );
-      }
-      final pending = await _pending.load();
-      if (pending != null &&
-          !pending.matches(
-            PendingOperationType.start,
-            cycleId,
-            standId,
-            userId,
-          )) {
-        throw const AppException(
-          'A previous lock operation still needs recovery. Repeat the same cycle and stand operation first.',
         );
       }
       final endpoint = EspEndpoint.fromStand(stand);

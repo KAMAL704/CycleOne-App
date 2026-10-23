@@ -251,7 +251,7 @@ class _CycleScreenState extends State<CycleScreen> {
                   leading: Icon(Icons.warning_amber_rounded),
                   title: Text('Recovery required'),
                   subtitle: Text(
-                    'A verified lock action still needs a server update. Repeat the same scan or selection only; CycleOne will not pulse the lock again.',
+                    'The lock action was already verified, but the server update is pending. Reconnect to the internet and repeat the same scan or selection only; CycleOne will not pulse the lock again.',
                   ),
                 ),
               ),

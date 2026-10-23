@@ -444,6 +444,26 @@ class _AdminCyclesTabState extends State<AdminCyclesTab> {
     return '$action: $error';
   }
 
+  String _displayStatus(Map<String, dynamic> cycle) {
+    final status = cycle['status']?.toString() ?? 'unknown';
+    final physical = cycle['physical_state']?.toString() ?? 'unknown';
+    // Physical absence is the useful operator state. Keep the database
+    // lifecycle value (maintenance/available) intact for permissions and
+    // audit, but never make an empty assigned stand look like maintenance.
+    if (status == 'in_use') return 'in ride';
+    if (physical == 'absent') return 'absent';
+    return status;
+  }
+
+  String _standLabel(Map<String, dynamic> cycle) {
+    final relation = cycle['stands'];
+    if (relation is Map && relation['name'] != null) {
+      return relation['name'].toString();
+    }
+    final standId = cycle['stand_id']?.toString();
+    return standId == null || standId.isEmpty ? 'Unassigned' : 'Assigned stand';
+  }
+
   String? _cycleQrData(Map<String, dynamic> cycle) {
     final directMac = EspEndpoint.normalizeMac(
       cycle['esp_mac']?.toString() ?? '',
@@ -552,10 +572,9 @@ class _AdminCyclesTabState extends State<AdminCyclesTab> {
                               const SizedBox(height: 10),
                           itemBuilder: (context, index) {
                             final cycle = _visibleCycles[index];
-                            final stand = cycle['stands'] is Map
-                                ? (cycle['stands'] as Map)['name']
-                                : 'Unassigned';
+                            final stand = _standLabel(cycle);
                             final status = cycle['status'].toString();
+                            final displayStatus = _displayStatus(cycle);
                             final physical =
                                 cycle['physical_state']?.toString() ??
                                 'unknown';
@@ -563,13 +582,15 @@ class _AdminCyclesTabState extends State<AdminCyclesTab> {
                               child: ListTile(
                                 leading: Icon(
                                   Icons.pedal_bike,
-                                  color: status == 'available'
+                                  color: displayStatus == 'available'
                                       ? Colors.green
+                                      : displayStatus == 'absent'
+                                      ? Colors.deepOrange
                                       : Colors.orange,
                                 ),
                                 title: Text(cycle['cycle_number'].toString()),
                                 subtitle: Text(
-                                  '$stand · $status · physical: $physical',
+                                  '$stand · $displayStatus · physical: $physical',
                                 ),
                                 isThreeLine: false,
                                 trailing: PopupMenuButton<String>(

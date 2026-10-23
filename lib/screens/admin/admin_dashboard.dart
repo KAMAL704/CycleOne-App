@@ -243,17 +243,30 @@ class _AdminOverviewTabState extends State<AdminOverviewTab> {
       );
     }
     final stand = _findById(_stands, row['stand_id']);
+    final status = _displayCycleStatus(row);
     return ListTile(
       leading: Icon(
         Icons.pedal_bike,
-        color: row['status'] == 'available' ? Colors.green : Colors.orange,
+        color: status == 'available'
+            ? Colors.green
+            : status == 'absent'
+            ? Colors.deepOrange
+            : Colors.orange,
       ),
       title: Text(row['cycle_number']?.toString() ?? 'Unnamed cycle'),
       subtitle: Text(
-        '${row['status']} · physical ${row['physical_state'] ?? 'unknown'}\n${stand?['name'] ?? 'Unassigned'}',
+        '$status · physical ${row['physical_state'] ?? 'unknown'}\n${stand?['name'] ?? (row['stand_id'] == null ? 'Unassigned' : 'Assigned stand')}',
       ),
       isThreeLine: true,
     );
+  }
+
+  String _displayCycleStatus(Map<String, dynamic> cycle) {
+    final status = cycle['status']?.toString() ?? 'unknown';
+    final physical = cycle['physical_state']?.toString() ?? 'unknown';
+    if (status == 'in_use') return 'in ride';
+    if (physical == 'absent') return 'absent';
+    return status;
   }
 
   Map<String, dynamic>? _findById(List<Map<String, dynamic>> rows, Object? id) {
